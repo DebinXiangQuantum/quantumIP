@@ -2,6 +2,9 @@ import numpy as np
 import qutip as qt
 from itertools import product
 import matplotlib.pyplot as plt
+import os
+if not os.path.exists('figs'):
+    os.mkdir('figs')
 
 # Parameters for simulation
 N = 7  # Fock space truncation per mode (dim = N^3 = 216, manageable)
@@ -138,7 +141,8 @@ plt.tight_layout()
 plt.suptitle('Initial state |x1,x2,x3> = {}'.format(initial_fock)+
              '\n , constraint: {}'.format(" + ".join(f"{c}*x{i+1}" for i,c in enumerate(constraint_coeffs)) 
                                           + f" = {target_value}"), y=-0.02)
-plt.savefig('verification_plot.svg')
+if os.
+plt.savefig('figs/verification_plot.svg')
 plt.show()  # Display if in interactive mode
 
 # Print final satisfaction and top states
