@@ -4,226 +4,389 @@ from itertools import product
 import matplotlib.pyplot as plt
 import matplotlib
 from scipy.optimize import minimize
+import sympy as sp
+from typing import List, Tuple, Optional, Union
 
-# --------------------------
-# 1. 基础配置：中文显示 + 参数定义
-# --------------------------
-# 解决中文显示问题
-matplotlib.rcParams["font.family"] = ["Heiti TC"]
-matplotlib.rcParams["axes.unicode_minus"] = False
 
-# 问题核心参数
-N = 7  # Fock空间截断维度
-num_modes = 3
-p = 2  # QAOA层数（传统分层核心参数）
-constraint_coeffs = [3, 1, 1]  # 约束：3n1 + n2 + n3 = 6
-target_value = 6
-target_operator = None  # 目标函数算符（后续初始化）
-null_space_basis = [np.array([1, -3, 0]), np.array([0, 1, -1])]  # 硬约束零空间向量
+class BosonicQAOAIPSolver:
+    """
+    Bosonic QAOA solver for arbitrary non-negative integer linear programming (IP):
+    max c^T x s.t. A x = b, x >= 0 integer.
+    
+    Encoding: x_i <-> n_i (photon number in mode i).
+    Constraint subspace S_c: { |n> | A n = b }.
+    Driver H_M: sum_u (O_u + O_u^dagger) over integer nullspace basis of A.
+    Cost H_C = - sum c_i n_i.
+    
+    Args:
+        A: Constraint matrix (m x d, integer coeffs).
+        b: RHS vector (m, integer targets).
+        c: Objective coeffs (d, maximize c^T x).
+        N: Fock truncation per mode.
+        p: QAOA layers.
+        num_modes: d (inferred from A/c if not given).
+        g: Driver coupling strength.
+        maxiter: Optimization iterations.
+        seed: Random seed.
+    """
+    
+    def __init__(
+        self,
+        A: np.ndarray,
+        b: np.ndarray,
+        c: np.ndarray,
+        N: int = 7,
+        p: int = 2,
+        g: float = 1.0,
+        maxiter: int = 150,
+        seed: int = 42,
+        num_modes: Optional[int] = None,
+        circuit_type: str = "beta_gamma"  # or "multi_beta"
+    ):
+        self.A = np.array(A, dtype=int)
+        self.b = np.array(b, dtype=int)
+        self.c = np.array(c, dtype=float)
+        self.N = N
+        self.p = p
+        self.g = g
+        self.maxiter = maxiter
+        self.seed = seed
+        self.num_modes = num_modes or self.c.shape[0] or self.A.shape[1]
+        
+        # Validate dimensions
+        if self.A.shape[1] != self.num_modes or self.c.shape[0] != self.num_modes:
+            raise ValueError("Dimensions mismatch: A (m x d), b (m), c (d).")
+        if self.A.shape[0] != self.b.shape[0]:
+            raise ValueError("A rows != b length.")
+        
+        np.random.seed(seed)
+        
+        # Compute integer nullspace basis using sympy
+        self.null_space_basis = self._compute_integer_nullspace()
+        print(f"Computed integer nullspace basis with {len(self.null_space_basis)} vectors.")
+        for null_vec in self.null_space_basis:
+            print(f"  Null vector: {null_vec}")
+        # Build Hamiltonians and operators
+        self.a_ops, self.ad_ops, self.n_ops = self._build_operators()
+        self.H_C = self._build_cost_hamiltonian()
+        self.H_ds = self._build_seperate_driver_hamiltonian()
+        self.H_M = sum(self.H_ds)
+        self.target_operator = -self.H_C  # For expectation: max c^T n
+        self.circuit_type = circuit_type
+        if circuit_type == "beta_gamma":
+            self.qaoa_circuit = self.qaoa_circuit_beta_gamma
+            self.paramlength = 2  # gamma, beta per layer
+        elif circuit_type == "multi_beta":
+            self.qaoa_circuit = self.qaoa_multi_beta_layer_circuit
+            self.paramlength = len(self.null_space_basis)  # beta_i per layer
+        elif circuit_type == "multi_beta_oneH":
+            self.qaoa_circuit = self.qaoa_multi_beta_oneH_circuit
+            self.paramlength = len(self.null_space_basis)  # beta_i per layer
+        else:
+            raise ValueError("circuit_type must be 'beta_gamma' or 'multi_beta'")
+        # Find feasible states for initial and tracking
+        self.feasible_states = self._find_feasible_states()
+        if not self.feasible_states:
+            raise ValueError("No feasible states found in truncation N.")
+        
+        # Tracked states: sorted by objective descending (top 6 or all if fewer)
+        self.initial_state = min(self.feasible_states, key=lambda ns: sum(self.c * ns))
+        self.tracked_states = sorted(self.feasible_states, key=lambda ns: sum(self.c * ns), reverse=True)[:6]+[self.initial_state]
+        self.tracked_labels = [f"|{','.join(map(str, ns))}⟩ (obj={sum(self.c * ns):.1f})" for ns in self.tracked_states]
+        
+        print(f"Initialized BosonicQAOAIPSolver: {self.num_modes} modes, {len(self.null_space_basis)} null vectors.")
+        print(f"Constraints: A x = b (shape {self.A.shape}). Objective: max {self.c} · x.")
+        print(f"Feasible subspace dim: {len(self.feasible_states)} (in truncation N={N}).")
+        print(f"initial_state: |{','.join(map(str, self.initial_state))}⟩")
+    
+    def _compute_integer_nullspace(self) -> List[np.ndarray]:
+        """Compute primitive integer basis for ker(A) using sympy nullspace."""
+        A_sym = sp.Matrix(self.A)
+        ns_rational = A_sym.nullspace()
+        if not ns_rational:
+            raise ValueError("Nullspace empty; constraints overconstrained.")
+        
+        # Collect denominators
+        denoms = []
+        for vec in ns_rational:
+            for entry in vec:
+                if hasattr(entry, 'is_Rational') and entry.is_Rational:
+                    denoms.append(entry.q)  # denominator
+        lcm_den = sp.lcm(denoms) if denoms else sp.Integer(1)
+        
+        # Integer vectors
+        int_vecs = []
+        for vec in ns_rational:
+            int_vec = (lcm_den * vec).applyfunc(lambda x: int(x))
+            # Make primitive: gcd of components
+            int_vec = np.array(int_vec).flatten().astype(int)
+            gcd = np.gcd.reduce(int_vec)
+            if gcd != 0:
+                int_vec = int_vec // gcd
+            # Flip sign if first non-zero is negative
+            if int_vec[int(np.nonzero(int_vec)[0][0])] < 0:
+                int_vec = -int_vec
+            int_vecs.append(int_vec)
+        
+        # Remove duplicates (if any)
+        unique_vecs = set(tuple(v) for v in int_vecs)
+        unique_vecs = np.array(list(unique_vecs))
+        
+        ## add a new vector for circle loop
+        ## add first vector and last vector to make a circle loop， then gcd to make it primitive
+        # if len(unique_vecs)>1:
+        #     first_vec = unique_vecs[0]
+        #     last_vec = unique_vecs[-1]
+        #     new_vec = first_vec + last_vec
+        #     new_vec_minus = first_vec - last_vec
+        #     if len(np.nonzero(new_vec)[0]) < len(np.nonzero(new_vec_minus)[0]):
+        #         new_vec = new_vec
+        #     else:
+        #         new_vec = new_vec_minus
+        #     gcd = np.gcd.reduce(new_vec)
+        #     if gcd != 0:
+        #         new_vec = new_vec // gcd
+        #     if new_vec[int(np.nonzero(new_vec)[0][0])] < 0:
+        #         new_vec = -new_vec
+        #     unique_vecs = np.vstack([unique_vecs, new_vec])
+        
+        return unique_vecs
+    
+    def _build_operators(self) -> Tuple[List[qt.Qobj], List[qt.Qobj], List[qt.Qobj]]:
+        """Build a_i, a_i^dagger, n_i for all modes."""
+        a_ops = []
+        ad_ops = []
+        n_ops = []
+        for i in range(self.num_modes):
+            ops_list = [qt.qeye(self.N)] * self.num_modes
+            ops_list[i] = qt.destroy(self.N)
+            a = qt.tensor(ops_list)
+            ad = a.dag()
+            n = ad * a
+            a_ops.append(a)
+            ad_ops.append(ad)
+            n_ops.append(n)
+        return a_ops, ad_ops, n_ops
+    
+    def _build_cost_hamiltonian(self) -> qt.Qobj:
+        """H_C = - sum c_i n_i."""
+        H_C = sum(-self.c[i] * self.n_ops[i] for i in range(self.num_modes))
+        return H_C
+    
+    def _build_driver_hamiltonian(self) -> qt.Qobj:
+        """H_M = g sum_u (O_u + O_u^dagger)."""
+        H_M = 0 * self.a_ops[0]
+        for u in self.null_space_basis:
+            O_u = qt.qeye(1)
+            for i in range(self.num_modes):
+                if u[i] > 0:
+                    O_u = O_u * (self.ad_ops[i] ** u[i])
+                elif u[i] < 0:
+                    O_u = O_u * (self.a_ops[i] ** abs(u[i]))
+            H_M += self.g * (O_u + O_u.dag())
+        return H_M
+    
+    def _build_seperate_driver_hamiltonian(self) -> qt.Qobj:
+        """H_M = g sum_u (O_u + O_u^dagger)."""
+        Hds = []
+        for u in self.null_space_basis:
+            H_M = 0 * self.a_ops[0]
+            O_u = 1
+            for i in range(self.num_modes):
+                if u[i] > 0:
+                    O_u = O_u * (self.ad_ops[i] ** int(u[i]))
+                elif u[i] < 0:
+                    O_u = O_u * (self.a_ops[i] ** abs(u[i]))
+            H_M += self.g * (O_u + O_u.dag())
+            Hds.append(H_M)
+        return Hds
+    
+    def _find_feasible_states(self) -> List[Tuple[int, ...]]:
+        """Enumerate feasible n in [0,N)^d with A n = b (integer)."""
+        feasible = []
+        for ns_tuple in product(range(self.N), repeat=self.num_modes):
+            ns = np.array(ns_tuple)
+            if np.allclose(self.A @ ns, self.b):
+                feasible.append(tuple(ns))
+        return feasible
+    
+    def create_initial_state(self, superposition: bool = False) -> qt.Qobj:
+        """Superposition of argmax/argmin objective feasible states, or max if not superpose."""
+        if not superposition:
+            ## select the state with maximum objective
+            
+            return qt.tensor(*[qt.fock(self.N, n) for n in self.initial_state])
+        
+        max_ns = max(self.feasible_states, key=lambda ns: sum(self.c * ns))
+        min_ns = min(self.feasible_states, key=lambda ns: sum(self.c * ns))
+        state1 = qt.tensor(*[qt.fock(self.N, n) for n in max_ns])
+        state2 = qt.tensor(*[qt.fock(self.N, n) for n in min_ns])
+        return (state1 + state2).unit()
+    
+    def qaoa_circuit_beta_gamma(self, params: np.ndarray, initial_state: qt.Qobj) -> qt.Qobj:
+        """p-layer QAOA: prod (U_M(beta) U_C(gamma))."""
+        state = initial_state.copy()
+        for layer in range(self.p):
+            gamma = params[2 * layer]
+            beta = params[2 * layer + 1]
+            state = (-1j * self.H_C * gamma).expm() * state
+            state = (-1j * self.H_M * beta).expm() * state
+        return state
+    def qaoa_multi_beta_layer_circuit(self, params: np.ndarray, initial_state: qt.Qobj) -> qt.Qobj:
+        """p-layer QAOA: prod (U_d1(beta1) U_d2(beta2) ...)."""
+        betalength = len(self.null_space_basis)
+        if len(params) != self.p * (betalength):
+            raise ValueError(f"Expected {self.p * (betalength)} params, got {len(params)}.")
+            
+        state = initial_state.copy()
+        for layer in range(self.p):
+            for i in range(betalength):
+                beta = params[layer * (betalength) + i]
+                state = (-1j * self.H_ds[i] * beta).expm() * state
+        return state
+    def qaoa_multi_beta_oneH_circuit(self, params: np.ndarray, initial_state: qt.Qobj) -> qt.Qobj:
+        """p-layer QAOA: prod (U_d(beta1,beta2)...)."""
+        betalength = len(self.null_space_basis)
+        if len(params) != self.p * (betalength):
+            raise ValueError(f"Expected {self.p * (betalength)} params, got {len(params)}.")
+            
+        state = initial_state.copy()
+        for layer in range(self.p):
+            betas = params[layer * (betalength):(layer + 1) * (betalength)]
+            H_d_layer = sum(betas[i] * self.H_ds[i] for i in range(betalength))
+            state = (-1j * H_d_layer).expm() * state
+        return state
+    
+    
+    def optimize(self, initial_state: Optional[qt.Qobj] = None) -> dict:
+        """COBYLA optimization with history tracking."""
+        if initial_state is None:
+            initial_state = self.create_initial_state()
+        
+        # History dict
+        self.iter_history = {"iter": [], "cost": [], "prob": np.zeros((0, len(self.tracked_states)))}
+        
+        def cost_with_history(params: np.ndarray) -> float:
+            iter_idx = len(self.iter_history["iter"])
+            self.iter_history["iter"].append(iter_idx + 1)
+            
+            final_state = self.qaoa_circuit(params, initial_state)
+            cost_val = qt.expect(self.H_C, final_state)
+            self.iter_history["cost"].append(cost_val)
+            
+            # Track probs for selected states
+            current_probs = []
+            for ns in self.tracked_states:
+                basis = qt.tensor(*[qt.fock(self.N, n) for n in ns])
+                prob = abs(basis.overlap(final_state)) ** 2
+                current_probs.append(prob)
+            self.iter_history["prob"] = np.vstack([self.iter_history["prob"], current_probs])
+            
+            return cost_val
+        
+        # Initial params
+        init_params = np.random.uniform(0, np.pi, self.paramlength * self.p)
+        
+        result = minimize(
+            fun=cost_with_history,
+            x0=init_params,
+            method="COBYLA",
+            options={"maxiter": self.maxiter, "disp": True}
+        )
+        
+        self.optimal_params = result.x
+        self.final_state = self.qaoa_circuit(self.optimal_params, initial_state)
+        self.final_cost = result.fun
+        self.final_obj = -self.final_cost  # Maximized objective
+        
+        print(f"\nOptimization complete: Optimal params {self.optimal_params.round(4)}, Obj={self.final_obj:.4f}")
+        return {"params": self.optimal_params, "obj": self.final_obj, "state": self.final_state}
+    
+    def get_fock_probs(self, state: qt.Qobj) -> np.ndarray:
+        """P(n) for all n in [0,N)^d."""
+        probs = np.zeros((self.N,) * self.num_modes)
+        for ns in product(range(self.N), repeat=self.num_modes):
+            basis = qt.tensor(*[qt.fock(self.N, n) for n in ns])
+            probs[ns] = abs(basis.overlap(state)) ** 2
+        return probs
+    
+    def plot_results(self, save_path: str = "figs/qaoa_ip_results.svg") -> None:
+        """Plot iteration history, costs, probs, objectives."""
+        final_probs = self.get_fock_probs(self.final_state)
+        final_tracked_probs = [final_probs[ns] for ns in self.tracked_states]
+        
+        fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+        
+        # Subplot 1: Tracked state probs over iterations
+        colors = plt.cm.Set3(np.linspace(0, 1, len(self.tracked_states)))
+        for i, label in enumerate(self.tracked_labels):
+            axes[0, 0].plot(self.iter_history["iter"], self.iter_history["prob"][:, i],
+                            linewidth=2.5, label=label, color=colors[i], marker="o", markersize=3)
+        axes[0, 0].set_xlabel("Optimization Iteration")
+        axes[0, 0].set_ylabel("State Probability")
+        axes[0, 0].set_title(f"QAOA Iteration: Tracked State Probabilities (p={self.p})")
+        axes[0, 0].legend(bbox_to_anchor=(1.05, 1), loc="upper left")
+        axes[0, 0].grid(alpha=0.3)
+        
+        # Subplot 2: Cost convergence
+        axes[0, 1].plot(self.iter_history["iter"], self.iter_history["cost"],
+                        linewidth=3, color="red", marker="s", markersize=4)
+        axes[0, 1].set_xlabel("Optimization Iteration")
+        axes[0, 1].set_ylabel("<H_C>")
+        axes[0, 1].set_title("Cost Function Convergence")
+        axes[0, 1].grid(alpha=0.3)
+        
+        # Subplot 3: Final tracked probs bar
+        bars = axes[1, 0].bar(range(len(final_tracked_probs)), final_tracked_probs, color=colors)
+        for bar, prob in zip(bars, final_tracked_probs):
+            axes[1, 0].text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.01,
+                            f"{prob:.3f}", ha="center", va="bottom", fontsize=10)
+        axes[1, 0].set_xlabel("Tracked States")
+        axes[1, 0].set_ylabel("Final Probability")
+        axes[1, 0].set_title("Final State Probabilities")
+        axes[1, 0].set_xticks(range(len(final_tracked_probs)))
+        axes[1, 0].set_xticklabels([lbl.split(" (")[0] for lbl in self.tracked_labels], rotation=45, ha="right")
+        axes[1, 0].grid(axis="y", alpha=0.3)
+        
+        # Subplot 4: Objective over iterations
+        obj_history = [-cost for cost in self.iter_history["cost"]]
+        max_obj = max([sum(self.c * ns) for ns in self.feasible_states])
+        axes[1, 1].plot(self.iter_history["iter"], obj_history,
+                        linewidth=3, color="green", marker="^", markersize=4)
+        axes[1, 1].axhline(y=max_obj, color="orange", linestyle="--", linewidth=2, label=f"Max Obj ({max_obj})")
+        axes[1, 1].set_xlabel("Optimization Iteration")
+        axes[1, 1].set_ylabel("Objective <c^T x>")
+        axes[1, 1].set_title("Objective Improvement")
+        axes[1, 1].legend()
+        axes[1, 1].grid(alpha=0.3)
+        
+        plt.tight_layout()
+        plt.savefig(save_path)
+        plt.show()
+    
+    def print_summary(self) -> None:
+        """Print optimization summary and top states."""
+        print(f"\n=== IP Solution Summary ===")
+        print(f"Objective: {self.final_obj:.4f} (max possible: {max(sum(self.c * ns) for ns in self.feasible_states):.4f})")
+        print(f"Improvement: {self.final_obj + self.iter_history['cost'][0]:.4f}")
+        
+        final_probs = self.get_fock_probs(self.final_state)
+        top_feasible = sorted(
+            [(ns, final_probs[ns], sum(self.c * ns))
+             for ns in self.feasible_states if final_probs[ns] > 1e-3],
+            key=lambda x: x[1], reverse=True
+        )
+        print(f"\nTop 3 feasible states by probability:")
+        for i, (ns, prob, obj) in enumerate(top_feasible[:3]):
+            print(f"  {i+1}: |{','.join(map(str, ns))}⟩ → P={prob:.4f}, Obj={obj:.4f}")
 
-# 重点跟踪的核心基态（覆盖高/中/低目标值，共6个）
-tracked_states = [
-    (0, 6, 0),  # 目标值12（理论最优）
-    (0, 5, 1),  # 目标值11（次优）
-    (0, 4, 2),  # 目标值10（中优）
-    (0, 3, 3),  # 目标值9（中优）
-    (0, 2, 4),  # 目标值8（中低优）
-    (0, 0, 6)   # 目标值6（初始态之一，低优）
-]
-tracked_labels = [f"|{n1},{n2},{n3}> (t={n1+2*n2+n3})" for n1, n2, n3 in tracked_states]
-
-# --------------------------
-# 2. 初始化量子算符（成本H_C + 混合H_M）
-# --------------------------
-def init_qaoa_hamiltonians():
-    global target_operator
-    # 基础算符：湮灭/产生/粒子数算符
-    a = [qt.tensor([qt.qeye(N) if i != j else qt.destroy(N) for j in range(num_modes)]) 
-         for i in range(num_modes)]
-    ad = [op.dag() for op in a]
-    n = [ad[i] * a[i] for i in range(num_modes)]  # 粒子数算符 n_i = a_i†a_i
-
-    # 成本哈密顿量 H_C（最大化n1+2n2+n3 → 转最小化 -目标函数）
-    target_operator = n[0] + 2 * n[1] + n[2]
-    H_C = -target_operator
-
-    # 混合哈密顿量 H_M（约束子空间内搅拌）
-    H_M = 0 * a[0]
-    for u in null_space_basis:
-        O_u = 1
-        for i in range(num_modes):
-            if u[i] > 0:
-                O_u *= ad[i] ** u[i]
-            elif u[i] < 0:
-                O_u *= a[i] ** abs(u[i])
-        H_M += (O_u + O_u.dag())
-
-    return H_C, H_M, n
-
-H_C, H_M, n = init_qaoa_hamiltonians()
-
-# --------------------------
-# 3. 传统QAOA核心：分层量子电路
-# --------------------------
-def qaoa_circuit(params, initial_state):
-    """分层演化：p层H_C→H_M交替"""
-    state = initial_state.copy()
-    for i in range(p):
-        gamma = params[2*i]    # 第i层H_C参数
-        beta = params[2*i + 1] # 第i层H_M参数
-        state = qt.propagator(H_C, gamma) * state  # H_C演化
-        state = qt.propagator(H_M, beta) * state   # H_M演化
-    return state
-
-# --------------------------
-# 4. 经典优化：跟踪迭代过程中基态概率（核心新增）
-# --------------------------
-# 存储迭代过程数据：迭代次数、成本值、各跟踪基态概率
-iter_history = {
-    "iter": [],          # 迭代序号
-    "cost": [],          # 每次迭代的成本值
-    "prob": np.zeros((0, len(tracked_states)))  # 每次迭代的基态概率（行：迭代，列：基态）
-}
-
-def qaoa_cost_with_history(params, initial_state):
-    """带历史跟踪的成本函数：计算成本时，同步记录基态概率"""
-    # 记录当前迭代次数（iter_history["iter"]的长度即当前迭代数）
-    current_iter = len(iter_history["iter"]) + 1
-    iter_history["iter"].append(current_iter)
-
-    # 1. 计算当前参数的成本值
-    final_state = qaoa_circuit(params, initial_state)
-    cost_val = qt.expect(H_C, final_state)
-    iter_history["cost"].append(cost_val)
-
-    # 2. 计算并记录当前迭代中，各跟踪基态的概率
-    current_probs = []
-    for (n1, n2, n3) in tracked_states:
-        basis = qt.tensor(qt.fock(N, n1), qt.fock(N, n2), qt.fock(N, n3))
-        prob = abs(basis.overlap(final_state)) ** 2
-        current_probs.append(prob)
-    iter_history["prob"] = np.vstack([iter_history["prob"], current_probs])
-
-    return cost_val
-
-# 初始化满足约束的初始态
-def init_valid_initial_state():
-    state1 = qt.tensor(qt.fock(N, 0), qt.fock(N, 6), qt.fock(N, 0))  # |0,6,0>
-    state2 = qt.tensor(qt.fock(N, 0), qt.fock(N, 0), qt.fock(N, 6))  # |0,0,6>
-    return (state1 + state2).unit()
-
-initial_state = init_valid_initial_state()
-
-# 初始化经典优化参数（2p个随机参数，范围[0, π]）
-np.random.seed(42)
-initial_params = np.random.uniform(0, np.pi, 2*p)
-
-# 经典优化：带历史跟踪的最小化
-optim_result = minimize(
-    fun=qaoa_cost_with_history,
-    x0=initial_params,
-    args=(initial_state,),
-    method="COBYLA",
-    options={"maxiter": 150, "disp": True}  # 迭代150次：足够观察概率变化趋势
-)
-
-optimal_params = optim_result.x
-print(f"\n=== 传统QAOA经典优化完成 ===")
-print(f"最优分层参数（γ1, β1, γ2, β2）：{optimal_params.round(4)}")
-print(f"最小成本值：{optim_result.fun:.6f}")
-print(f"总迭代次数：{len(iter_history['iter'])}")
-
-# --------------------------
-# 5. 结果分析工具函数
-# --------------------------
-def get_fock_probs(state):
-    probs = np.zeros((N, N, N))
-    for n1, n2, n3 in product(range(N), repeat=3):
-        basis = qt.tensor(qt.fock(N, n1), qt.fock(N, n2), qt.fock(N, n3))
-        probs[n1, n2, n3] = abs(basis.overlap(state)) ** 2
-    return probs
-
-def calculate_target_expect(state):
-    return qt.expect(target_operator, state)
-
-# --------------------------
-# 6. 可视化：重点新增“迭代过程基态概率折线图”
-# --------------------------
-final_state = qaoa_circuit(optimal_params, initial_state)
-final_probs = get_fock_probs(final_state)
-final_target_expect = calculate_target_expect(final_state)
-
-# 创建4个子图：迭代概率、成本变化、最终概率、目标值分布
-plt.figure(figsize=(16, 12))
-
-# 子图1：核心！每次迭代各基态的概率折线图
-plt.subplot(2, 2, 1)
-colors = plt.cm.Set3(np.linspace(0, 1, len(tracked_states)))  # 区分度高的颜色
-for i in range(len(tracked_states)):
-    plt.plot(iter_history["iter"], iter_history["prob"][:, i], 
-             linewidth=2.5, label=tracked_labels[i], color=colors[i], marker="o", markersize=3)
-plt.xlabel("经典优化迭代次数")
-plt.ylabel("基态概率")
-plt.title(f"QAOA迭代过程：核心基态概率变化（p={p}层）")
-plt.legend(bbox_to_anchor=(1.05, 1), loc="upper left")  # 图例放右侧，避免遮挡
-plt.grid(alpha=0.3)
-
-# 子图2：迭代过程中成本值变化（验证优化收敛性）
-plt.subplot(2, 2, 2)
-plt.plot(iter_history["iter"], iter_history["cost"], 
-         linewidth=3, color="#d62728", marker="s", markersize=4)
-plt.xlabel("经典优化迭代次数")
-plt.ylabel("成本值（<H_C>）")
-plt.title("QAOA迭代过程：成本值收敛趋势")
-plt.grid(alpha=0.3)
-
-# 子图3：最终迭代的核心基态概率分布（柱状图）
-plt.subplot(2, 2, 3)
-final_tracked_probs = [final_probs[n1, n2, n3] for (n1, n2, n3) in tracked_states]
-bars = plt.bar(tracked_labels, final_tracked_probs, color=colors)
-# 标注最终概率值
-for bar, prob in zip(bars, final_tracked_probs):
-    plt.text(bar.get_x()+bar.get_width()/2, bar.get_height()+0.01,
-             f"{prob:.3f}", ha="center", va="bottom", fontsize=10)
-plt.xlabel("核心基态（带目标值）")
-plt.ylabel("最终概率")
-plt.title("最终迭代：核心基态概率分布")
-plt.xticks(rotation=45, ha="right")
-plt.grid(axis="y", alpha=0.3)
-
-# 子图4：目标函数期望值与迭代次数关系
-plt.subplot(2, 2, 4)
-# 计算每次迭代的目标函数期望值（= -成本值）
-target_history = [-cost for cost in iter_history["cost"]]
-plt.plot(iter_history["iter"], target_history, 
-         linewidth=3, color="#2ca02c", marker="^", markersize=4)
-plt.axhline(y=12, color="#ff7f0e", linestyle="--", linewidth=2, label="理论最大目标值（12）")
-plt.xlabel("经典优化迭代次数")
-plt.ylabel("目标函数期望值（n1+2n2+n3）")
-plt.title("QAOA迭代过程：目标函数值提升趋势")
-plt.legend()
-plt.grid(alpha=0.3)
-
-plt.tight_layout()
-plt.savefig("figs/qaoa_iteration_prob_history.svg")
-plt.show()
-
-# --------------------------
-# 7. 最终结果打印
-# --------------------------
-print(f"\n=== 最终结果详情 ===")
-print(f"1. 目标函数期望值：{final_target_expect:.4f}（理论最大值：12）")
-print(f"\n2. 迭代过程关键指标变化：")
-print(f"   - 初始目标值：{target_history[0]:.4f}")
-print(f"   - 最终目标值：{target_history[-1]:.4f}")
-print(f"   - 目标值提升幅度：{target_history[-1]-target_history[0]:.4f}")
-print(f"\n3. 最终概率最高的3个基态：")
-valid_states = [
-    ((n1, n2, n3), final_probs[n1, n2, n3], n1+2*n2+n3)
-    for n1, n2, n3 in product(range(N), repeat=3)
-    if sum(constraint_coeffs[j] * [n1, n2, n3][j] for j in range(num_modes)) == target_value
-    and final_probs[n1, n2, n3] > 1e-3
-]
-valid_states.sort(key=lambda x: x[1], reverse=True)
-for i, ((n1, n2, n3), prob, target) in enumerate(valid_states[:3]):
-    print(f"   第{i+1}名：|{n1},{n2},{n3}> → 概率={prob:.4f}，目标值={target}")
+# Example usage for original problem
+if __name__ == "__main__":
+    A = [[2, 1, 1, 1],[1, 2, 1, 1]]
+    b = [6,4]
+    c = [1, -1, 1, 2]
+    
+    solver = BosonicQAOAIPSolver(A, b, c, N=7, p=2,circuit_type="multi_beta_oneH")
+    result = solver.optimize()
+    solver.plot_results(save_path="figs/qaoa_ip_multi_beta_oneH.svg")
+    solver.print_summary()
