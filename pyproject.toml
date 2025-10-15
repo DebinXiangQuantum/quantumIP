@@ -11,7 +11,7 @@ requires-python = ">=3.8"
 dependencies = [
     "qutip",
     "matplotlib",
-    "sympy"
+    "sympy",
 ]
 
 [build-system]

@@ -6,6 +6,7 @@ import matplotlib
 from scipy.optimize import minimize
 import sympy as sp
 from typing import List, Tuple, Optional, Union, Dict
+from scipy.linalg import eigh
 
 
 class BosonicQAOAIPSolver:
@@ -384,6 +385,115 @@ class BosonicQAOAIPSolver:
         for i, (ns, prob, obj) in enumerate(top_feasible[:3]):
             print(f"  {i+1}: |{','.join(map(str, ns))}⟩ → P={prob:.4f}, Obj={obj:.4f}")
 
+    def _build_identity(self) -> qt.Qobj:
+        """Build identity operator for multi-mode Hilbert space."""
+        ops = [qt.qeye(self.N) for _ in range(self.num_modes)]
+        return qt.tensor(ops)
+
+    def mitigate_gse_expect(self, rho_noisy: qt.Qobj, O: qt.Qobj, subspace_type: str = 'power', K: int = 2, A: Optional[qt.Qobj] = None) -> Tuple[float, float]:
+        """
+        Mitigate expectation value <O> using Generalized Quantum Subspace Expansion (GSE).
+
+        Constructs the mitigated state via the power subspace spanned by {I, ρ, ρ², ..., ρᴷ},
+        solving the generalized eigenvalue problem for the lowest "energy" under O as the effective Hamiltonian.
+
+        Note: Computationally intensive for large Hilbert dimensions; suitable for small N or num_modes.
+
+        Returns:
+            Tuple (raw_expectation, gse_mitigated_expectation)
+        """
+        if A is None:
+            A = self._build_identity()
+
+        # Build power subspace bases σ_i = ρ^{i} for i = 0 to K
+        sigmas = []
+        current = self._build_identity()
+        rho_current = current
+        for i in range(K + 1):
+            sigmas.append(rho_current)
+            rho_current = rho_current * rho_noisy
+
+        d_s = len(sigmas)
+        S = np.zeros((d_s, d_s), dtype=complex)
+        O_mat = np.zeros((d_s, d_s), dtype=complex)  # Effective matrix for O
+
+        for i in range(d_s):
+            sigma_i_dag = sigmas[i].dag()
+            for j in range(d_s):
+                temp = sigma_i_dag * A * sigmas[j]
+                S[i, j] = temp.tr().real
+                O_mat[i, j] = (temp * O).tr()
+
+        # Solve generalized eigenvalue problem: O α = E S α, select minimal E
+        evals, evecs = eigh(O_mat, S)
+        idx_min = np.argmin(evals.real)
+        alpha = evecs[:, idx_min]
+        norm = np.sqrt(np.real(alpha.conj().T @ S @ alpha))
+        if norm > 1e-10:
+            alpha = alpha / norm
+
+        o_raw = (rho_noisy * O).tr().real
+        o_gse = np.real(alpha.conj().T @ O_mat @ alpha)
+
+        return o_raw, o_gse
+
+    def _apply_noise(self, rho: qt.Qobj, noise_config: Dict) -> qt.Qobj:
+        """Apply noise channel to density operator ρ."""
+        noise_type = noise_config.get('type', 'amplitude_damping')
+        rate = noise_config.get('rate', 0.05)
+        dt = 0.01  # Small time step for approximation
+
+        if noise_type == 'amplitude_damping':
+            # Amplitude damping on all modes (zero temperature)
+            c_ops = [np.sqrt(rate) * a for a in self.a_ops]
+        elif noise_type == 'dephasing':
+            # Dephasing on number basis
+            c_ops = [np.sqrt(rate) * n for n in self.n_ops]
+        else:
+            raise ValueError(f"Unsupported noise type: {noise_type}")
+
+        H_noise = 0 * rho  # No coherent part
+        times = [0, dt]
+        result = qt.mesolve(H_noise, rho, times, c_ops)
+        return result.states[-1]
+
+    def simulate_noisy_qaoa(self, params: np.ndarray, noise_config: Dict, initial_state: Optional[qt.Qobj] = None) -> qt.Qobj:
+        """
+        Simulate noisy QAOA circuit with noise after each layer.
+
+        Assumes beta_gamma circuit_type for simplicity; extend for others as needed.
+
+        Args:
+            params: Optimized parameters from optimize().
+            noise_config: Dict e.g., {'type': 'amplitude_damping', 'rate': 0.05}.
+            initial_state: Initial state (default: self.create_initial_state()).
+
+        Returns:
+            Noisy final density operator ρ.
+        """
+        if initial_state is None:
+            initial_state = self.create_initial_state(superposition=True)
+        rho = initial_state * initial_state.dag()
+
+        if self.circuit_type != 'beta_gamma':
+            raise ValueError("Noisy simulation currently supports 'beta_gamma' only.")
+
+        for layer in range(self.p):
+            gamma = params[2 * layer]
+            beta = params[2 * layer + 1]
+
+            # Cost layer U_C(γ)
+            U_C = (-1j * self.H_C * gamma).expm()
+            rho = U_C * rho * U_C.dag()
+            rho = self._apply_noise(rho, noise_config)
+
+            # Mixer layer U_M(β)
+            U_M = (-1j * self.H_M * beta).expm()
+            rho = U_M * rho * U_M.dag()
+            rho = self._apply_noise(rho, noise_config)
+
+        return rho
+
     def _build_constraint_violation_operator(self) -> qt.Qobj:
         """Build violation operator V = \sum_j ( \sum_i A_{j,i} \hat{n}_i - b_j )^2."""
         m_constraints = self.A.shape[0]
@@ -426,103 +536,152 @@ class BosonicQAOAIPSolver:
 
         return Ls
 
+    def mitigate_gse_violation(self, rho_noisy: qt.Qobj, V: qt.Qobj, K: int = 2, A: Optional[qt.Qobj] = None) -> Tuple[float, float]:
+        """
+        Mitigate constraint violation <V> using GSE on noisy rho.
+
+        Similar to mitigate_gse_expect, but specialized for V.
+        Returns (raw <V>, GSE <V>).
+        """
+        return self.mitigate_gse_expect(rho_noisy, V, subspace_type='power', K=K, A=A)
+
     def simulate_errors(
         self,
         error_configs: List[Dict],
         tlist: np.ndarray,
         H_evol: Optional[qt.Qobj] = None,
         initial_state: Optional[qt.Qobj] = None,
+        gse_K: int = 2,
         plot: bool = True,
-        save_path: str = "figs/error_simulation.svg"
-    ) -> Dict[str, np.ndarray]:
+        save_path: str = "figs/error_simulation_gse.svg"
+    ) -> Dict[str, Tuple[np.ndarray, np.ndarray]]:
         """
-        Simulate subspace confinement under noisy evolution for multiple error configurations.
+        Simulate subspace confinement under noisy evolution, with GSE mitigation.
 
-        The constraint violation is quantified by the expectation value of the operator
-        \[
-        \hat{V} = \sum_{j=1}^m \left( \sum_{i=1}^d A_{j,i} \hat{n}_i - b_j \right)^2,
-        \]
-        where \(\langle \hat{V} \rangle = 0\) indicates perfect confinement in the feasible subspace \(\{ | \mathbf{n} \rangle \mid A \mathbf{n} = \mathbf{b} \}\).
+        Computes both raw <V>(t) and GSE-mitigated <V_gse>(t) for each config.
 
         Args:
-            error_configs: List of dicts, each specifying an error, e.g.,
-                           [{'type': 'photon_loss', 'mode': 0, 'rate': 1.0},
-                            {'type': 'thermal', 'mode': 0, 'rate': 1.0, 'n_th': 0.5}, ...]
-            tlist: Time array for evolution.
-            H_evol: Coherent Hamiltonian for evolution (default: self.H_M).
-            initial_state: Initial state (default: uniform superposition over feasible states).
-            plot: Whether to plot violation vs. time.
-            save_path: Path to save plot.
-
+            ... (same as before)
+            gse_K: Order K for power subspace {I, ρ, ..., ρ^K}.
+        
         Returns:
-            Dict of {error_label: violation(t)} arrays.
+            Dict of {error_label: (raw_viol(t), gse_viol(t))} tuples.
         """
         if H_evol is None:
             H_evol = self.H_M
         if initial_state is None:
-            # Uniform superposition over feasible states
             psi_list = [qt.tensor(*[qt.fock(self.N, n) for n in ns]) for ns in self.feasible_states]
             initial_state = sum(psi_list) / np.sqrt(len(psi_list))
         rho0 = initial_state * initial_state.dag()
 
-        V = self._build_constraint_violation_operator()  # Violation operator
+        V = self._build_constraint_violation_operator()
+        I = self._build_identity()
+        A_gse = I  # Default A = I
 
-        violations = {}  # {label: <V>(t)}
+        results = {}  # {label: (raw_expects, gse_expects)}
 
         for config in error_configs:
             label = f"{config['type']} (mode {config.get('mode', 0)})"
             Ls = self._get_lindblad_operators(config)
 
-            # For Kerr, add H_kerr to H_evol
             H_total = H_evol
             if config.get('type') == 'kerr_loss':
                 chi = config.get('chi', 0.1)
-                H_kerr = chi * self.n_ops[config.get('mode', 0)] * (self.n_ops[config.get('mode', 0)] - 1) / 2
+                mode = config.get('mode', 0)
+                H_kerr = chi * self.n_ops[mode] * (self.n_ops[mode] - 1) / 2
                 H_total += H_kerr
 
-            # Evolve under Lindblad ME
+            # Evolve
             result = qt.mesolve(H_total, rho0, tlist, Ls)
-            expects = qt.expect(V, result.states)
-            violations[label] = expects
+            raw_expects = qt.expect(V, result.states)
+
+            # GSE mitigation for each t
+            gse_expects = np.zeros_like(raw_expects)
+            for idx, rho_t in enumerate(result.states):
+                _, gse_val = self.mitigate_gse_violation(rho_t, V, K=gse_K, A=A_gse)
+                gse_expects[idx] = gse_val
+
+            results[label] = (raw_expects, gse_expects)
 
         if plot:
-            plt.figure(figsize=(10, 6))
-            for label, viol_t in violations.items():
-                plt.plot(tlist, viol_t, label=label, linewidth=2)
-            # Ideal (no noise)
+            fig, ax = plt.subplots(figsize=(10, 6))
+            colors = plt.cm.tab10(np.linspace(0, 1, len(error_configs)))
+            for idx, (label, (raw_t, gse_t)) in enumerate(results.items()):
+                color = colors[idx]
+                ax.plot(tlist, raw_t, label=f"{label} (Raw)", color=color, linewidth=2, linestyle='-')
+                ax.plot(tlist, gse_t, label=f"{label} (GSE)", color=color, linewidth=2, linestyle='--')
+
+            # Ideal
             result_ideal = qt.mesolve(H_evol, rho0, tlist, [])
             viol_ideal = qt.expect(V, result_ideal.states)
-            plt.plot(tlist, viol_ideal, 'k--', label='Ideal (No Error)', linewidth=2)
-            plt.xlabel('Time $t$')
-            plt.ylabel(r'$\langle \hat{V} \rangle$')
-            plt.title(r'Constraint Violation $\langle \hat{V} \rangle$ Under Errors')
-            plt.legend()
-            plt.grid(True, alpha=0.3)
-            plt.yscale('log')  # Log scale for small violations
+            _, gse_ideal = self.mitigate_gse_violation(result_ideal.states[0], V, K=gse_K, A=A_gse)  # Constant
+            ax.plot(tlist, viol_ideal, 'k-', label='Ideal (Raw)', linewidth=2)
+            ax.plot(tlist, np.full_like(tlist, gse_ideal), 'k--', label='Ideal (GSE)', linewidth=2)
+
+            ax.set_xlabel('Time $t$')
+            ax.set_ylabel(r'$\langle \hat{V} \rangle$')
+            ax.set_title(r'Constraint Violation $\langle \hat{V} \rangle$ Under Errors (Raw vs. GSE)')
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+            ax.set_yscale('log')
             plt.tight_layout()
             plt.savefig(save_path)
             plt.show()
 
-        return violations
+        return results
 
-# Example usage for original problem
+
+# Import the full BosonicQAOAIPSolver class definition here
+# (Paste the complete class code from previous responses, including all methods)
+
 if __name__ == "__main__":
-    A = [[2, 1, 1, 1],[1, 2, 1, 1]]
-    b = [6,4]
-    c = [1, -1, 1, 2]
-    
-    solver = BosonicQAOAIPSolver(A, b, c, N=7, p=2,circuit_type="multi_beta")
-    result = solver.optimize()
-    solver.plot_results(save_path="figs/qaoa_ip_multi_beta.svg")
+    # Step 1: Define problem instance (small for demo: max x1 - x2 s.t. x1 + x2 = 1)
+    A = np.array([[2,1,1],[1,1,1]])  # Constraint matrix
+    b = np.array([3,2])        # RHS vector
+    c = np.array([1, -1, 2])  # Objective coefficients
+    N_trunc = 5              # Fock truncation (small for efficiency)
+    p_layers = 2             # QAOA layers
+    g_driver = 1.0           # Driver strength
+
+    # Step 2: Initialize solver
+    solver = BosonicQAOAIPSolver(
+        A=A, b=b, c=c, N=N_trunc, p=p_layers, g=g_driver,
+        circuit_type="multi_beta", maxiter=50, seed=42
+    )
+
+    # Step 3: Optimize QAOA (ideal case)
+    initial_state_opt = solver.create_initial_state(superposition=True)  # Uniform feasible superposition
+    opt_result = solver.optimize(initial_state=initial_state_opt)
     solver.print_summary()
 
-    # Example error simulation
+    # Step 4: Define error configurations for simulation
     error_configs = [
-        {'type': 'photon_loss', 'mode': 0, 'rate': 1.0},
-        {'type': 'photon_gain', 'mode': 0, 'rate': 1.0},
-        {'type': 'thermal', 'mode': 0, 'rate': 1.0, 'n_th': 0.5},
-        {'type': 'cross_mode_unbalanced', 'mode': 0, 'other_mode': 1, 'eta': 0.5, 'imbalance_rate': 0.1},
-        {'type': 'kerr_loss', 'mode': 0, 'chi': 0.1, 'imbalance_rate': 0.05}
+        {'type': 'photon_loss', 'mode': 0, 'rate': 0.5},      # Single-mode loss
+        {'type': 'photon_gain', 'mode': 1, 'rate': 0.5},       # Single-mode gain
+        {'type': 'thermal', 'mode': 0, 'rate': 0.5, 'n_th': 0.1},  # Thermal noise
+        {'type': 'cross_mode_unbalanced', 'mode': 0, 'other_mode': 1, 'eta': 0.3, 'imbalance_rate': 0.2},
+        {'type': 'kerr_loss', 'mode': 0, 'chi': 0.1, 'imbalance_rate': 0.1}  # Kerr + loss
     ]
-    tlist = np.linspace(0, 0.1, 50)
-    violations = solver.simulate_errors(error_configs, tlist, H_evol=solver.H_M)
+
+    # Step 5: Time array for evolution
+    tlist = np.linspace(0, 0.2, 20)  # 20 time points up to t=0.2
+
+    # Step 6: Call simulate_errors with GSE (K=2 for power subspace)
+    gse_order_K = 2
+    results = solver.simulate_errors(
+        error_configs=error_configs,
+        tlist=tlist,
+        H_evol=solver.H_M,  # Evolve under driver Hamiltonian
+        initial_state=initial_state_opt,
+        gse_K=gse_order_K,
+        plot=True,  # Generate plot
+        save_path="figs/gse_violation_comparison.svg"
+    )
+
+    # Step 7: Analyze and print results (e.g., final violation reduction)
+    print("\n=== GSE Mitigation Summary (at final t) ===")
+    for label, (raw_viol, gse_viol) in results.items():
+        final_raw = raw_viol[-1]
+        final_gse = gse_viol[-1]
+        reduction = (final_raw - final_gse) / final_raw * 100 if final_raw > 0 else 0
+        print(f"{label}: Raw <V> = {final_raw:.4f}, GSE <V> = {final_gse:.4f}, Reduction = {reduction:.1f}%")
