@@ -509,7 +509,7 @@ class BosonicQAOAIPSolver:
         mode = error_config.get('mode', 0)
         rate = error_config.get('rate', 1.0)
         n_th = error_config.get('n_th', 0.5)
-        chi = error_config.get('chi', 0.1)
+        # chi = error_config.get('chi', 0.1)
         eta = error_config.get('eta', 0.5)
         imbalance_rate = error_config.get('imbalance_rate', 0.1)
         other_mode = error_config.get('other_mode', 1)  # For cross-mode
@@ -570,8 +570,7 @@ class BosonicQAOAIPSolver:
         if H_evol is None:
             H_evol = self.H_M
         if initial_state is None:
-            psi_list = [qt.tensor(*[qt.fock(self.N, n) for n in ns]) for ns in self.feasible_states]
-            initial_state = sum(psi_list) / np.sqrt(len(psi_list))
+            initial_state = self.create_initial_state()
         rho0 = initial_state * initial_state.dag()
 
         V = self._build_constraint_violation_operator()
@@ -636,9 +635,9 @@ class BosonicQAOAIPSolver:
 
 if __name__ == "__main__":
     # Step 1: Define problem instance (small for demo: max x1 - x2 s.t. x1 + x2 = 1)
-    A = np.array([[2,1,1],[1,1,1]])  # Constraint matrix
+    A = np.array([[1,-1,1,1],[1,1,-1,0]])  # Constraint matrix
     b = np.array([3,2])        # RHS vector
-    c = np.array([1, -1, 2])  # Objective coefficients
+    c = np.array([1, -1, 2,1])  # Objective coefficients
     N_trunc = 5              # Fock truncation (small for efficiency)
     p_layers = 2             # QAOA layers
     g_driver = 1.0           # Driver strength
@@ -649,9 +648,8 @@ if __name__ == "__main__":
         circuit_type="multi_beta", maxiter=50, seed=42
     )
 
-    # Step 3: Optimize QAOA (ideal case)
-    initial_state_opt = solver.create_initial_state(superposition=True)  # Uniform feasible superposition
-    opt_result = solver.optimize(initial_state=initial_state_opt)
+    opt_result = solver.optimize()
+    solver.plot_results(save_path="figs/qaoa_ip_multi_beta.svg")
     solver.print_summary()
 
     # Step 4: Define error configurations for simulation
@@ -667,12 +665,12 @@ if __name__ == "__main__":
     tlist = np.linspace(0, 0.2, 20)  # 20 time points up to t=0.2
 
     # Step 6: Call simulate_errors with GSE (K=2 for power subspace)
-    gse_order_K = 2
+    gse_order_K = 3
     results = solver.simulate_errors(
         error_configs=error_configs,
         tlist=tlist,
         H_evol=solver.H_M,  # Evolve under driver Hamiltonian
-        initial_state=initial_state_opt,
+        initial_state=None,
         gse_K=gse_order_K,
         plot=True,  # Generate plot
         save_path="figs/gse_violation_comparison.svg"

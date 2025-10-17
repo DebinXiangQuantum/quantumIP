@@ -193,7 +193,26 @@ class BosonicQAOAIPSolver:
     def _build_seperate_driver_hamiltonian(self) -> List[qt.Qobj]:
         """H_M = g sum_u (O_u + O_u^dagger)."""
         Hds = []
+        latex_labels = []
+        idx = 1
         for u in self.null_space_basis:
+            ## print the latex code for each driver hamiltonian
+            latex_label = f"g_{{{idx}}} ("
+            for i in range(self.num_modes):
+                if u[i] > 0:
+                    latex_label += f"a_{{{i}}}^{{{u[i]}}} " if u[i] > 1 else f"a_{{{i}}} "
+                elif u[i] < 0:
+                    latex_label += f"a_{{{i}}}^{{\\dagger {abs(u[i])}}} " if abs(u[i]) > 1 else f"a_{{{i}}}^{{\\dagger}} "
+            ## dagger part
+            latex_label += " + "
+            for i in range(self.num_modes):
+                if u[i] > 0:
+                    latex_label += f"a_{{{i}}}^{{\\dagger {u[i]}}} " if u[i] > 1 else f"a_{{{i}}}^{{\\dagger}} "
+                elif u[i] < 0:
+                    latex_label += f"a_{{{i}}}^{{{abs(u[i])}}} " if abs(u[i]) > 1 else f"a_{{{i}}} "
+            latex_label += ")"
+            idx += 1
+            latex_labels.append(latex_label)
             H_M = 0 * self.a_ops[0]
             O_u = 1
             for i in range(self.num_modes):
@@ -203,6 +222,7 @@ class BosonicQAOAIPSolver:
                     O_u = O_u * (self.a_ops[i] ** abs(u[i]))
             H_M += self.g * (O_u + O_u.dag())
             Hds.append(H_M)
+        self.latex_label_H_M = " + ".join(latex_labels)
         return Hds
     
     def _find_feasible_states(self) -> List[Tuple[int, ...]]:
@@ -512,6 +532,10 @@ if __name__ == "__main__":
     c = [1, -1, 1, 2]
     
     solver = BosonicQAOAIPSolver(A, b, c, N=7, p=2,circuit_type="multi_beta")
+    ## Hamiltonian of solver
+    print("Driver Hamiltonian H_M:")
+    print(solver.latex_label_H_M)
+    print(solver.H_M)
     result = solver.optimize()
     solver.plot_results(save_path="figs/qaoa_ip_multi_beta.svg")
     solver.print_summary()
