@@ -10,17 +10,17 @@ from typing import List, Tuple, Optional, Union, Dict
 
 class BosonicQAOAIPSolver:
     """
-    Bosonic QAOA solver for arbitrary non-negative integer linear programming (IP):
-    max c^T x s.t. A x = b, x >= 0 integer.
+    Bosonic QAOA solver for integer programs with linear or quadratic constraints:
+    max c^T x s.t. constraint, x >= 0 integer.
     
     Encoding: x_i <-> n_i (photon number in mode i).
-    Constraint subspace S_c: { |n> | A n = b }.
+    Constraint subspace S_c: { |n> | constraint holds }.
     Driver H_M: sum_u (O_u + O_u^dagger) over integer nullspace basis of A.
     Cost H_C = - sum c_i n_i.
     
     Args:
-        A: Constraint matrix (m x d, integer coeffs).
-        b: RHS vector (m, integer targets).
+        A: Constraint matrix (m x d integer for linear; d x d symmetric integer for quadratic).
+        b: RHS (m-vector integer for linear; scalar [b] for quadratic).
         c: Objective coeffs (d, maximize c^T x).
         N: Fock truncation per mode.
         p: QAOA layers.
@@ -28,6 +28,8 @@ class BosonicQAOAIPSolver:
         g: Driver coupling strength.
         maxiter: Optimization iterations.
         seed: Random seed.
+        constraint_type: 'linear' or 'quadratic'.
+        circuit_type: "beta_gamma" or "multi_beta".
     """
     
     def __init__(
@@ -41,8 +43,10 @@ class BosonicQAOAIPSolver:
         maxiter: int = 150,
         seed: int = 42,
         num_modes: Optional[int] = None,
-        circuit_type: str = "beta_gamma"  # or "multi_beta"
+        constraint_type: str = "linear",
+        circuit_type: str = "beta_gamma"
     ):
+        self.constraint_type = constraint_type
         self.A = np.array(A, dtype=int)
         self.b = np.array(b, dtype=int)
         self.c = np.array(c, dtype=float)
@@ -54,10 +58,18 @@ class BosonicQAOAIPSolver:
         self.num_modes = num_modes or self.c.shape[0] or self.A.shape[1]
         
         # Validate dimensions
-        if self.A.shape[1] != self.num_modes or self.c.shape[0] != self.num_modes:
-            raise ValueError("Dimensions mismatch: A (m x d), b (m), c (d).")
-        if self.A.shape[0] != self.b.shape[0]:
-            raise ValueError("A rows != b length.")
+        if constraint_type == "linear":
+            if self.A.shape[1] != self.num_modes or self.c.shape[0] != self.num_modes:
+                raise ValueError("Dimensions mismatch: A (m x d), b (m), c (d).")
+            if self.A.shape[0] != self.b.shape[0]:
+                raise ValueError("A rows != b length.")
+        else:  # quadratic
+            if self.A.shape[0] != self.A.shape[1] or self.A.shape[0] != self.num_modes:
+                raise ValueError("For quadratic, A must be d x d.")
+            if self.b.shape[0] != 1:
+                raise ValueError("For quadratic, b must be scalar (array of len 1).")
+            if not np.allclose(self.A, self.A.T):
+                raise ValueError("A must be symmetric for quadratic.")
         
         np.random.seed(seed)
         
@@ -91,12 +103,11 @@ class BosonicQAOAIPSolver:
         
         # Tracked states: sorted by objective descending (top 6 or all if fewer)
         self.initial_state = min(self.feasible_states, key=lambda ns: sum(self.c * ns))
-        # self.initial_state = np.array([2,0,3,3])
-        self.tracked_states = sorted(self.feasible_states, key=lambda ns: sum(self.c * ns), reverse=True)[:6]+[self.initial_state]
+        self.tracked_states = sorted(self.feasible_states, key=lambda ns: sum(self.c * ns), reverse=True)[:6] + [self.initial_state]
         self.tracked_labels = [f"|{','.join(map(str, ns))}⟩ (obj={sum(self.c * ns):.1f})" for ns in self.tracked_states]
         
         print(f"Initialized BosonicQAOAIPSolver: {self.num_modes} modes, {len(self.null_space_basis)} null vectors.")
-        print(f"Constraints: A x = b (shape {self.A.shape}). Objective: max {self.c} · x.")
+        print(f"Constraints: {self.constraint_type}, A shape {self.A.shape}. Objective: max {self.c} · x.")
         print(f"Feasible subspace dim: {len(self.feasible_states)} (in truncation N={N}).")
         print(f"initial_state: |{','.join(map(str, self.initial_state))}⟩")
     
@@ -119,23 +130,20 @@ class BosonicQAOAIPSolver:
         int_vecs = []
         for vec in ns_rational:
             int_vec = (lcm_den * vec).applyfunc(lambda x: int(x))
-            # Make primitive: gcd of components
             int_vec = np.array(int_vec).flatten().astype(int)
             gcd = np.gcd.reduce(int_vec)
             if gcd != 0:
                 int_vec = int_vec // gcd
             # Flip sign if first non-zero is negative
-            if int_vec[int(np.nonzero(int_vec)[0][0])] < 0:
+            if len(int_vec) > 0 and int_vec[int(np.nonzero(int_vec)[0][0])] < 0:
                 int_vec = -int_vec
             int_vecs.append(int_vec)
         
-        # Remove duplicates (if any)
-        unique_vecs = set(tuple(v) for v in int_vecs)
-        unique_vecs = np.array(list(unique_vecs))
+        # Remove duplicates
+        unique_vecs = [np.array(v) for v in set(tuple(vec) for vec in int_vecs)]
         
-        # add a new vector for circle loop
-        # add first vector and last vector to make a circle loop， then gcd to make it primitive
-        if len(unique_vecs)>1:
+        # Optional: Add circle loop vector if >1 basis
+        if len(unique_vecs) > 1:
             first_vec = unique_vecs[0]
             last_vec = unique_vecs[-1]
             new_vec = first_vec + last_vec
@@ -147,13 +155,10 @@ class BosonicQAOAIPSolver:
             gcd = np.gcd.reduce(new_vec)
             if gcd != 0:
                 new_vec = new_vec // gcd
-            if new_vec[int(np.nonzero(new_vec)[0][0])] < 0:
+            if len(new_vec) > 0 and new_vec[int(np.nonzero(new_vec)[0][0])] < 0:
                 new_vec = -new_vec
-            unique_vecs = np.vstack([unique_vecs, new_vec])
+            unique_vecs.append(new_vec)
         
-        ## add reverse direction
-        # reversed_vecs = -unique_vecs
-        # unique_vecs = np.vstack([unique_vecs, reversed_vecs])
         return unique_vecs
     
     def _build_operators(self) -> Tuple[List[qt.Qobj], List[qt.Qobj], List[qt.Qobj]]:
@@ -177,61 +182,43 @@ class BosonicQAOAIPSolver:
         H_C = sum(-self.c[i] * self.n_ops[i] for i in range(self.num_modes))
         return H_C
     
-    def _build_driver_hamiltonian(self) -> qt.Qobj:
-        """H_M = g sum_u (O_u + O_u^dagger)."""
-        H_M = 0 * self.a_ops[0]
-        for u in self.null_space_basis:
-            O_u = qt.qeye(1)
-            for i in range(self.num_modes):
-                if u[i] > 0:
-                    O_u = O_u * (self.ad_ops[i] ** u[i])
-                elif u[i] < 0:
-                    O_u = O_u * (self.a_ops[i] ** abs(u[i]))
-            H_M += self.g * (O_u + O_u.dag())
-        return H_M
-    
     def _build_seperate_driver_hamiltonian(self) -> List[qt.Qobj]:
         """H_M = g sum_u (O_u + O_u^dagger)."""
         Hds = []
         latex_labels = []
         idx = 1
         for u in self.null_space_basis:
-            ## print the latex code for each driver hamiltonian
-            latex_label = f"g_{{{idx}}} ("
+            latex_label = f"$g_{{{idx}}} \\left("
             for i in range(self.num_modes):
                 if u[i] > 0:
-                    latex_label += f"a_{{{i}}}^{{{u[i]}}} " if u[i] > 1 else f"a_{{{i}}} "
+                    latex_label += f"\\hat{{a}}_{{{i}}}^{{\\dagger {u[i]}}} " if u[i] > 1 else f"\\hat{{a}}_{{{i}}}^\\dagger "
                 elif u[i] < 0:
-                    latex_label += f"a_{{{i}}}^{{\\dagger {abs(u[i])}}} " if abs(u[i]) > 1 else f"a_{{{i}}}^{{\\dagger}} "
-            ## dagger part
-            latex_label += " + "
-            for i in range(self.num_modes):
-                if u[i] > 0:
-                    latex_label += f"a_{{{i}}}^{{\\dagger {u[i]}}} " if u[i] > 1 else f"a_{{{i}}}^{{\\dagger}} "
-                elif u[i] < 0:
-                    latex_label += f"a_{{{i}}}^{{{abs(u[i])}}} " if abs(u[i]) > 1 else f"a_{{{i}}} "
-            latex_label += ")"
+                    latex_label += f"\\hat{{a}}_{{{i}}}^{{{abs(u[i])}}} " if abs(u[i]) > 1 else f"\\hat{{a}}_{{{i}}} "
+            latex_label += "+ \\mathrm{h.c.} \\right)$"
             idx += 1
             latex_labels.append(latex_label)
-            H_M = 0 * self.a_ops[0]
             O_u = 1
             for i in range(self.num_modes):
                 if u[i] > 0:
                     O_u = O_u * (self.ad_ops[i] ** int(u[i]))
                 elif u[i] < 0:
                     O_u = O_u * (self.a_ops[i] ** abs(u[i]))
-            H_M += self.g * (O_u + O_u.dag())
+            H_M = self.g * (O_u + O_u.dag())
             Hds.append(H_M)
         self.latex_label_H_M = " + ".join(latex_labels)
         return Hds
     
     def _find_feasible_states(self) -> List[Tuple[int, ...]]:
-        """Enumerate feasible n in [0,N)^d with A n = b (integer)."""
+        """Enumerate feasible n in [0,N)^d satisfying the constraint."""
         feasible = []
         for ns_tuple in product(range(self.N), repeat=self.num_modes):
             ns = np.array(ns_tuple)
-            if np.allclose(self.A @ ns, self.b):
-                feasible.append(tuple(ns))
+            if self.constraint_type == "linear":
+                if np.allclose(self.A @ ns, self.b):
+                    feasible.append(tuple(ns))
+            else:  # quadratic
+                if np.allclose(np.dot(ns, self.A @ ns), self.b[0]):
+                    feasible.append(tuple(ns))
         return feasible
     
     def create_initial_state(self, superposition: bool = False) -> qt.Qobj:
@@ -405,13 +392,21 @@ class BosonicQAOAIPSolver:
             print(f"  {i+1}: |{','.join(map(str, ns))}⟩ → P={prob:.4f}, Obj={obj:.4f}")
 
     def _build_constraint_violation_operator(self) -> qt.Qobj:
-        """Build violation operator V = \sum_j ( \sum_i A_{j,i} \hat{n}_i - b_j )^2."""
-        m_constraints = self.A.shape[0]
-        V = 0 * self.n_ops[0]
-        for j in range(m_constraints):
-            C_j = sum(self.A[j, i] * self.n_ops[i] for i in range(self.num_modes))
-            V += (C_j - self.b[j]) ** 2
+        """Build violation operator V."""
+        if self.constraint_type == "linear":
+            m_constraints = self.A.shape[0]
+            V = 0 * self.n_ops[0]
+            for j in range(m_constraints):
+                C_j = sum(self.A[j, i] * self.n_ops[i] for i in range(self.num_modes))
+                V += (C_j - self.b[j]) ** 2
+        else:  # quadratic
+            C = 0 * self.n_ops[0]
+            for i in range(self.num_modes):
+                for j in range(self.num_modes):
+                    C += self.A[i,j] * self.n_ops[i] * self.n_ops[j]
+            V = (C - self.b[0]) ** 2
         return V
+    
 
     def _get_lindblad_operators(self, error_config: Dict) -> List[qt.Qobj]:
         """Return Lindblad operators L_k for a given error config."""

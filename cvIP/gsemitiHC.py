@@ -535,15 +535,56 @@ class BosonicQAOAIPSolver:
             # Note: chi added to H in simulation call
 
         return Ls
-
-    def mitigate_gse_violation(self, rho_noisy: qt.Qobj, V: qt.Qobj, K: int = 2, A: Optional[qt.Qobj] = None) -> Tuple[float, float]:
+    def mitigate_gse_violation(self, rho_noisy: qt.Qobj, V: qt.Qobj, K: int = 2, A: Optional[qt.Qobj] = None) -> Tuple[float, qt.Qobj]:
         """
-        Mitigate constraint violation <V> using GSE on noisy rho.
+        Mitigate constraint violation <V> using GSE, returning raw <V> and mitigated rho_EM^(V).
 
-        Similar to mitigate_gse_expect, but specialized for V.
-        Returns (raw <V>, GSE <V>).
+        Solves GSE with V as effective Hamiltonian to minimize E, constructs rho_EM^(V),
+        and returns (raw <V>, rho_EM^(V)).
+
+        Returns:
+            Tuple (raw <V>, rho_EM^(V): mitigated density operator).
         """
-        return self.mitigate_gse_expect(rho_noisy, V, subspace_type='power', K=K, A=A)
+        if A is None:
+            A = self._build_identity()
+
+        # Build power subspace bases σ_i = ρ^{i} for i = 0 to K
+        sigmas = []
+        current = self._build_identity()
+        rho_current = current
+        for i in range(K + 1):
+            sigmas.append(rho_current)
+            rho_current = rho_current * rho_noisy
+
+        d_s = len(sigmas)
+        S = np.zeros((d_s, d_s), dtype=complex)
+        V_mat = np.zeros((d_s, d_s), dtype=complex)  # Effective matrix for V
+
+        for i in range(d_s):
+            sigma_i_dag = sigmas[i].dag()
+            for j in range(d_s):
+                temp = sigma_i_dag * A * sigmas[j]
+                S[i, j] = temp.tr().real
+                V_mat[i, j] = (temp * V).tr()
+
+        # Solve generalized eigenvalue problem: V α = E S α, select minimal E
+        evals, evecs = eigh(V_mat, S)
+        idx_min = np.argmin(evals.real)
+        alpha = evecs[:, idx_min]
+        norm = np.sqrt(np.real(alpha.conj().T @ S @ alpha))
+        if norm > 1e-10:
+            alpha = alpha / norm
+
+        # Construct P = sum α_i σ_i
+        P = sum(alpha[i] * sigmas[i] for i in range(d_s))
+
+        # Mitigated rho_EM^(V)
+        rho_em = (P.dag() * A * P).unit()  # Normalize Tr[rho_EM] = 1
+
+        v_raw = (rho_noisy * V).tr().real
+        v_em = (rho_em * V).tr().real  # Optional: verify minimized <V>
+
+        return v_raw, v_em, rho_em
 
     def simulate_errors(
         self,
@@ -553,26 +594,27 @@ class BosonicQAOAIPSolver:
         initial_state: Optional[qt.Qobj] = None,
         gse_K: int = 2,
         plot: bool = True,
-        save_path: str = "figs/error_simulation_gse.svg"
+        save_path: str = "figs/error_simulation_hc_gse.svg"
     ) -> Dict[str, Tuple[np.ndarray, np.ndarray]]:
         """
-        Simulate subspace confinement under noisy evolution, with GSE mitigation.
+        Simulate noisy evolution: Mitigate V via GSE to get rho_EM^(V), then compute <H_C> on rho_EM^(V).
 
-        Computes both raw <V>(t) and GSE-mitigated <V_gse>(t) for each config.
+        Computes raw <H_C>(t) and sequential GSE-mitigated <H_C_gse>(t) for each config.
 
         Args:
             ... (same as before)
             gse_K: Order K for power subspace {I, ρ, ..., ρ^K}.
         
         Returns:
-            Dict of {error_label: (raw_viol(t), gse_viol(t))} tuples.
+            Dict of {error_label: (raw_HC(t), gse_HC(t))} tuples.
         """
         if H_evol is None:
             H_evol = self.H_M
         if initial_state is None:
-            initial_state = self.create_initial_state()
+            initial_state = self.create_initial_state(superposition=True)
         rho0 = initial_state * initial_state.dag()
 
+        HC = self.H_C  # Cost Hamiltonian
         V = self._build_constraint_violation_operator()
         I = self._build_identity()
         A_gse = I  # Default A = I
@@ -581,6 +623,8 @@ class BosonicQAOAIPSolver:
 
         for config in error_configs:
             label = f"{config['type']} (mode {config.get('mode', 0)})"
+            if "cross_mode" in config['type']:
+                label += f" & {config.get('other_mode', 1)}"
             Ls = self._get_lindblad_operators(config)
 
             H_total = H_evol
@@ -592,46 +636,59 @@ class BosonicQAOAIPSolver:
 
             # Evolve
             result = qt.mesolve(H_total, rho0, tlist, Ls)
-            raw_expects = qt.expect(V, result.states)
+            raw_expects = qt.expect(HC, result.states)
 
-            # GSE mitigation for each t
+            # Sequential GSE: Mitigate V first, then <H_C> on rho_EM^(V)
             gse_expects = np.zeros_like(raw_expects)
             for idx, rho_t in enumerate(result.states):
-                _, gse_val = self.mitigate_gse_violation(rho_t, V, K=gse_K, A=A_gse)
+                v_raw, v_em, rho_em_v = self.mitigate_gse_violation(rho_t, V, K=gse_K, A=A_gse)
+                gse_val = (rho_em_v * HC).tr().real
                 gse_expects[idx] = gse_val
 
             results[label] = (raw_expects, gse_expects)
 
         if plot:
-            fig, ax = plt.subplots(figsize=(10, 6))
+            fig, axes = plt.subplots(1,2,figsize=(14, 6))
             colors = plt.cm.tab10(np.linspace(0, 1, len(error_configs)))
+            ax = axes[0]
             for idx, (label, (raw_t, gse_t)) in enumerate(results.items()):
                 color = colors[idx]
                 ax.plot(tlist, raw_t, label=f"{label} (Raw)", color=color, linewidth=2, linestyle='-')
-                ax.plot(tlist, gse_t, label=f"{label} (GSE)", color=color, linewidth=2, linestyle='--')
+                ax.plot(tlist, gse_t, label=f"{label} (GSE-V then H_C)", color=color, linewidth=2, linestyle='--')
 
             # Ideal
             result_ideal = qt.mesolve(H_evol, rho0, tlist, [])
-            viol_ideal = qt.expect(V, result_ideal.states)
-            _, gse_ideal = self.mitigate_gse_violation(result_ideal.states[0], V, K=gse_K, A=A_gse)  # Constant
-            ax.plot(tlist, viol_ideal, 'k-', label='Ideal (Raw)', linewidth=2)
+            hc_ideal = qt.expect(HC, result_ideal.states)
+            _,_, rho_em_ideal = self.mitigate_gse_violation(result_ideal.states[0], V, K=gse_K, A=A_gse)
+            gse_ideal = (rho_em_ideal * HC).tr().real
+            ax.plot(tlist, hc_ideal, 'k-', label='Ideal (Raw)', linewidth=2)
             ax.plot(tlist, np.full_like(tlist, gse_ideal), 'k--', label='Ideal (GSE)', linewidth=2)
 
             ax.set_xlabel('Time $t$')
-            ax.set_ylabel(r'$\langle \hat{V} \rangle$')
-            ax.set_title(r'Constraint Violation $\langle \hat{V} \rangle$ Under Errors (Raw vs. GSE)')
+            ax.set_ylabel(r'$\langle H_C \rangle$')
+            ax.set_title(r'Sequential GSE: Mitigate $V$ then $\langle H_C \rangle$ Under Errors')
             ax.legend()
             ax.grid(True, alpha=0.3)
-            ax.set_yscale('log')
+            
+            ax1 = axes[1]
+            ## plot the difference between raw and ideal, gse and ideal
+            for idx, (label, (raw_t, gse_t)) in enumerate(results.items()):
+                color = colors[idx]
+                ax1.plot(tlist, raw_t - hc_ideal, label=f"{label} (Raw - Ideal)", color=color, linewidth=2, linestyle='-')
+                ax1.plot(tlist, gse_t - hc_ideal, label=f"{label} (GSE-V then H_C - Ideal)", color=color, linewidth=2, linestyle='--')
+            ax1.axhline(0, color='k', linestyle=':', linewidth=1)
+            ax1.set_xlabel('Time $t$')
+            ax1.set_ylabel(r'Difference from Ideal')
+            ax1.set_title(r'Difference from Ideal $\langle H_C \rangle$')
+            ax1.legend()
+            ax1.grid(True, alpha=0.3)
             plt.tight_layout()
             plt.savefig(save_path)
             plt.show()
 
         return results
-
-
-# Import the full BosonicQAOAIPSolver class definition here
-# (Paste the complete class code from previous responses, including all methods)
+    # Import the full BosonicQAOAIPSolver class definition here
+    # (Paste the complete class code from previous responses, including all methods)
 
 if __name__ == "__main__":
     # Step 1: Define problem instance (small for demo: max x1 - x2 s.t. x1 + x2 = 1)
@@ -662,10 +719,10 @@ if __name__ == "__main__":
     ]
 
     # Step 5: Time array for evolution
-    tlist = np.linspace(0, 5, 50)  # 20 time points up to t=0.2
+    tlist = np.linspace(0, 5, 100)  # 20 time points up to t=0.2
 
     # Step 6: Call simulate_errors with GSE (K=2 for power subspace)
-    gse_order_K = 3
+    gse_order_K = 2
     results = solver.simulate_errors(
         error_configs=error_configs,
         tlist=tlist,
@@ -673,7 +730,7 @@ if __name__ == "__main__":
         initial_state=None,
         gse_K=gse_order_K,
         plot=True,  # Generate plot
-        save_path="figs/gse_violation_comparison.svg"
+        save_path="figs/gse_violation_comparisonHC.svg"
     )
 
     # Step 7: Analyze and print results (e.g., final violation reduction)
@@ -682,4 +739,4 @@ if __name__ == "__main__":
         final_raw = raw_viol[-1]
         final_gse = gse_viol[-1]
         reduction = (final_raw - final_gse) / final_raw * 100 if final_raw > 0 else 0
-        print(f"{label}: Raw <V> = {final_raw:.4f}, GSE <V> = {final_gse:.4f}, Reduction = {reduction:.1f}%")
+        print(f"{label}: Raw <HC> = {final_raw:.4f}, GSE <HC> = {final_gse:.4f}, Reduction = {reduction:.1f}%")

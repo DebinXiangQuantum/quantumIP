@@ -262,12 +262,42 @@ class BosonicQAOAIPSolver:
             state = (-1j * H_d_layer).expm() * state
         return state
     
-    
-    def optimize(self, initial_state: Optional[qt.Qobj] = None) -> dict:
-        """COBYLA optimization with history tracking."""
+    def optimize(
+        self,
+        mode: str = 'ideal',
+        initial_state: Optional[qt.Qobj] = None,
+        noise_config: Optional[Dict] = None,
+        gse_K: int = 2,
+        **kwargs  # Pass to minimize (e.g., maxiter)
+    ) -> dict:
+        """
+        Optimize QAOA with optional noise and GSE mitigation.
+
+        Modes:
+            'ideal': Noiseless evaluation.
+            'noisy': Noisy circuit (noise after each layer).
+            'gse': Noisy circuit + sequential GSE (mitigate V, then <H_C>).
+
+        Args:
+            mode: Optimization mode ('ideal', 'noisy', 'gse').
+            initial_state: Initial state.
+            noise_config: Dict e.g., {'type': 'amplitude_damping', 'rate': 0.05}.
+            gse_K: GSE power subspace order (for 'gse' mode).
+            **kwargs: Options for scipy.optimize.minimize.
+
+        Returns:
+            Dict with 'params', 'obj', 'state' (noisy rho for 'noisy'/'gse'), 'history' (dict of iter/cost/prob).
+        """
+        valid_modes = ['ideal', 'noisy', 'gse']
+        if mode not in valid_modes:
+            raise ValueError(f"Mode must be one of {valid_modes}.")
+        if mode in ['noisy', 'gse'] and noise_config is None:
+            raise ValueError("noise_config required for 'noisy' or 'gse' modes.")
+
         if initial_state is None:
-            initial_state = self.create_initial_state()
-        
+            initial_state = self.create_initial_state(superposition=True)
+        self.mode = mode  # Store for history
+
         # History dict
         self.iter_history = {"iter": [], "cost": [], "prob": np.zeros((0, len(self.tracked_states)))}
         
@@ -275,20 +305,36 @@ class BosonicQAOAIPSolver:
             iter_idx = len(self.iter_history["iter"])
             self.iter_history["iter"].append(iter_idx + 1)
             
-            final_state = self.qaoa_circuit(params, initial_state)
-            cost_val = qt.expect(self.H_C, final_state)
+            # Evaluate circuit (ideal or noisy)
+            if mode == 'ideal':
+                final_state = self.qaoa_circuit(params, initial_state)
+            else:
+                final_state = self._evaluate_noisy_circuit(params, initial_state, noise_config)
+            
+            # Compute cost (raw or GSE-mitigated)
+            if mode == 'gse':
+                V = self._build_constraint_violation_operator()
+                _, _, rho_em_v = self.mitigate_gse_violation(final_state, V, K=gse_K)
+                cost_val = (rho_em_v * self.H_C).tr().real
+            else:
+                cost_val = qt.expect(self.H_C, final_state)
+            
             self.iter_history["cost"].append(cost_val)
             
-            # Track probs for selected states
+            # Track probs (on final_state for simplicity; use rho_em_v for 'gse' if desired)
+            if mode == 'gse':
+                track_state = rho_em_v
+            else:
+                track_state = final_state
             current_probs = []
             for ns in self.tracked_states:
                 basis = qt.tensor(*[qt.fock(self.N, n) for n in ns])
-                prob = abs(basis.overlap(final_state)) ** 2
+                prob = abs(basis.overlap(track_state)) ** 2
                 current_probs.append(prob)
             self.iter_history["prob"] = np.vstack([self.iter_history["prob"], current_probs])
             
             return cost_val
-        
+
         # Initial params
         init_params = np.random.uniform(0, np.pi, self.paramlength * self.p)
         
@@ -296,17 +342,138 @@ class BosonicQAOAIPSolver:
             fun=cost_with_history,
             x0=init_params,
             method="COBYLA",
-            options={"maxiter": self.maxiter, "disp": True}
+            options={**{"maxiter": self.maxiter, "disp": True}, **kwargs}
         )
         
         self.optimal_params = result.x
-        self.final_state = self.qaoa_circuit(self.optimal_params, initial_state)
+        if mode == 'ideal':
+            self.final_state = self.qaoa_circuit(self.optimal_params, initial_state)
+        else:
+            self.final_state = self._evaluate_noisy_circuit(self.optimal_params, initial_state, noise_config)
+            if mode == 'gse':
+                V = self._build_constraint_violation_operator()
+                _, _, self.final_state = self.mitigate_gse_violation(self.final_state, V, K=gse_K)
         self.final_cost = result.fun
-        self.final_obj = -self.final_cost  # Maximized objective
+        self.final_obj = -self.final_cost
         
-        print(f"\nOptimization complete: Optimal params {self.optimal_params.round(4)}, Obj={self.final_obj:.4f}")
-        return {"params": self.optimal_params, "obj": self.final_obj, "state": self.final_state}
+        print(f"\n{mode.upper()} Optimization complete: Obj={self.final_obj:.4f}")
+        return {"params": self.optimal_params, "obj": self.final_obj, "state": self.final_state, "history": self.iter_history}
+
+    def _evaluate_noisy_circuit(self, params: np.ndarray, initial_state: qt.Qobj, noise_config: Dict) -> qt.Qobj:
+        """Evaluate noisy QAOA circuit with noise after each unitary layer."""
+        rho = initial_state * initial_state.dag()
+        if self.circuit_type == "beta_gamma":
+            for layer in range(self.p):
+                gamma = params[2 * layer]
+                beta = params[2 * layer + 1]
+                # Cost layer
+                U_C = (-1j * self.H_C * gamma).expm()
+                rho = U_C * rho * U_C.dag()
+                rho = self._apply_noise(rho, noise_config)
+                # Mixer layer
+                U_M = (-1j * self.H_M * beta).expm()
+                rho = U_M * rho * U_M.dag()
+                rho = self._apply_noise(rho, noise_config)
+        elif self.circuit_type == "multi_beta":
+            betalength = len(self.null_space_basis)
+            for layer in range(self.p):
+                for i in range(betalength):
+                    beta = params[layer * betalength + i]
+                    U_di = (-1j * self.H_ds[i] * beta).expm()
+                    rho = U_di * rho * U_di.dag()
+                    rho = self._apply_noise(rho, noise_config)
+        elif self.circuit_type == "multi_beta_oneH":
+            betalength = len(self.null_space_basis)
+            for layer in range(self.p):
+                betas = params[layer * betalength : (layer + 1) * betalength]
+                H_d_layer = sum(betas[i] * self.H_ds[i] for i in range(betalength))
+                U_d = (-1j * H_d_layer).expm()
+                rho = U_d * rho * U_d.dag()
+                rho = self._apply_noise(rho, noise_config)
+        else:
+            raise ValueError(f"Noisy evaluation not supported for circuit_type '{self.circuit_type}'.")
+        return rho
+
+    def plot_optimization_comparison(
+        self,
+        modes: List[str],
+        noise_configs: List[Dict],
+        gse_K: int = 2,
+        save_path: str = "figs/optimization_comparison.svg"
+    ) -> None:
+        """
+        Run optimizations for multiple modes and noise configurations, plotting objective convergence.
+
+        Args:
+            modes: List of modes to include (e.g., ['ideal', 'noisy', 'gse']).
+            noise_configs: List of noise configurations (Dicts) for 'noisy' and 'gse' modes.
+            gse_K: GSE order for 'gse'.
+        """
+        histories = {}
+        initial_state_opt = self.create_initial_state(superposition=True)
+        
+        # Run ideal if requested
+        if 'ideal' in modes:
+            self.iter_history = {"iter": [], "cost": [], "prob": np.zeros((0, len(self.tracked_states)))}
+            _ = self.optimize(mode='ideal', initial_state=initial_state_opt)
+            histories['Ideal'] = self.iter_history
+        
+        # For each noise config, run noisy and/or gse if requested
+        for config in noise_configs:
+            label = self._get_config_label(config)
+            if 'noisy' in modes:
+                self.iter_history = {"iter": [], "cost": [], "prob": np.zeros((0, len(self.tracked_states)))}
+                _ = self.optimize(mode='noisy', initial_state=initial_state_opt, noise_config=config)
+                histories[f'Noisy - {label}'] = self.iter_history
+            if 'gse' in modes:
+                self.iter_history = {"iter": [], "cost": [], "prob": np.zeros((0, len(self.tracked_states)))}
+                _ = self.optimize(mode='gse', initial_state=initial_state_opt, noise_config=config, gse_K=gse_K)
+                histories[f'GSE - {label}'] = self.iter_history
+        
+        # Plot
+        fig, ax = plt.subplots(figsize=(10, 6))
+        all_keys = list(histories.keys())
+        num_lines = len(all_keys)
+        colors = plt.cm.tab10(np.linspace(0, 1, num_lines))
+        
+        max_obj = max([sum(self.c * ns) for ns in self.feasible_states])
+        
+        for idx, key in enumerate(all_keys):
+            hist = histories[key]
+            obj_hist = [-c for c in hist["cost"]]
+            color = colors[idx]
+            # Determine linestyle based on mode prefix
+            if key == 'Ideal':
+                ls = '-'
+            elif key.startswith('Noisy'):
+                ls = '--'
+            elif key.startswith('GSE'):
+                ls = ':'
+            else:
+                ls = '-'
+            ax.plot(hist["iter"], obj_hist, label=key, color=color, linewidth=2, linestyle=ls)
+        
+        ax.axhline(y=max_obj, color='gray', ls=':', alpha=0.7, label=f'Classical Max ({max_obj:.2f})')
+        
+        ax.set_xlabel("Optimization Iteration")
+        ax.set_ylabel("Objective $\langle \mathbf{c}^\top \mathbf{x} \rangle$")
+        ax.set_title("QAOA Optimization Convergence: Ideal vs. Noisy vs. GSE-Mitigated")
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(save_path)
+        plt.show()
     
+    def _get_config_label(self, config: Dict) -> str:
+        """Extract a label from noise config."""
+        t = config.get('type', 'unknown')
+        extras = []
+        if 'rate' in config and config['rate'] is not None:
+            extras.append(f"r={config['rate']}")
+        if 'mode' in config and config['mode'] is not None:
+            extras.append(f"m={config['mode']}")
+        return t + " " + " ".join(extras) if extras else t
+        
     def get_fock_probs(self, state: qt.Qobj) -> np.ndarray:
         """P(n) for all n in [0,N)^d."""
         probs = np.zeros((self.N,) * self.num_modes)
@@ -390,7 +557,7 @@ class BosonicQAOAIPSolver:
         ops = [qt.qeye(self.N) for _ in range(self.num_modes)]
         return qt.tensor(ops)
 
-    def mitigate_gse_expect(self, rho_noisy: qt.Qobj, O: qt.Qobj, subspace_type: str = 'power', K: int = 2, A: Optional[qt.Qobj] = None) -> Tuple[float, float]:
+    def mitigate_gse_expect(self, rho_noisy: qt.Qobj, O: qt.Qobj, subspace_type: str = 'power', K: int = 2, A: Optional[qt.Qobj] = None) -> Tuple[float, float, qt.Qobj]:
         """
         Mitigate expectation value <O> using Generalized Quantum Subspace Expansion (GSE).
 
@@ -400,7 +567,7 @@ class BosonicQAOAIPSolver:
         Note: Computationally intensive for large Hilbert dimensions; suitable for small N or num_modes.
 
         Returns:
-            Tuple (raw_expectation, gse_mitigated_expectation)
+            Tuple (raw_expectation, gse_mitigated_expectation, mitigated_rho)
         """
         if A is None:
             A = self._build_identity()
@@ -432,36 +599,33 @@ class BosonicQAOAIPSolver:
         if norm > 1e-10:
             alpha = alpha / norm
 
+        rho_mit = sum(alpha[i] * sigmas[i] for i in range(d_s))
         o_raw = (rho_noisy * O).tr().real
         o_gse = np.real(alpha.conj().T @ O_mat @ alpha)
 
-        return o_raw, o_gse
+        return o_raw, o_gse, rho_mit
 
     def _apply_noise(self, rho: qt.Qobj, noise_config: Dict) -> qt.Qobj:
         """Apply noise channel to density operator ρ."""
-        noise_type = noise_config.get('type', 'amplitude_damping')
-        rate = noise_config.get('rate', 0.05)
         dt = 0.01  # Small time step for approximation
 
-        if noise_type == 'amplitude_damping':
-            # Amplitude damping on all modes (zero temperature)
-            c_ops = [np.sqrt(rate) * a for a in self.a_ops]
-        elif noise_type == 'dephasing':
-            # Dephasing on number basis
-            c_ops = [np.sqrt(rate) * n for n in self.n_ops]
-        else:
-            raise ValueError(f"Unsupported noise type: {noise_type}")
+        Ls = self._get_lindblad_operators(noise_config)
 
-        H_noise = 0 * rho  # No coherent part
+        H_noise = 0 * rho
+        noise_type = noise_config.get('type', '')
+        if noise_type == 'kerr_loss':
+            chi = noise_config.get('chi', 0.1)
+            mode = noise_config.get('mode', 0)
+            H_kerr = chi * self.n_ops[mode] * (self.n_ops[mode] - 1) / 2
+            H_noise += H_kerr
+
         times = [0, dt]
-        result = qt.mesolve(H_noise, rho, times, c_ops)
+        result = qt.mesolve(H_noise, rho, times, Ls)
         return result.states[-1]
 
     def simulate_noisy_qaoa(self, params: np.ndarray, noise_config: Dict, initial_state: Optional[qt.Qobj] = None) -> qt.Qobj:
         """
         Simulate noisy QAOA circuit with noise after each layer.
-
-        Assumes beta_gamma circuit_type for simplicity; extend for others as needed.
 
         Args:
             params: Optimized parameters from optimize().
@@ -473,26 +637,7 @@ class BosonicQAOAIPSolver:
         """
         if initial_state is None:
             initial_state = self.create_initial_state(superposition=True)
-        rho = initial_state * initial_state.dag()
-
-        if self.circuit_type != 'beta_gamma':
-            raise ValueError("Noisy simulation currently supports 'beta_gamma' only.")
-
-        for layer in range(self.p):
-            gamma = params[2 * layer]
-            beta = params[2 * layer + 1]
-
-            # Cost layer U_C(γ)
-            U_C = (-1j * self.H_C * gamma).expm()
-            rho = U_C * rho * U_C.dag()
-            rho = self._apply_noise(rho, noise_config)
-
-            # Mixer layer U_M(β)
-            U_M = (-1j * self.H_M * beta).expm()
-            rho = U_M * rho * U_M.dag()
-            rho = self._apply_noise(rho, noise_config)
-
-        return rho
+        return self._evaluate_noisy_circuit(params, initial_state, noise_config)
 
     def _build_constraint_violation_operator(self) -> qt.Qobj:
         """Build violation operator V = \sum_j ( \sum_i A_{j,i} \hat{n}_i - b_j )^2."""
@@ -509,7 +654,6 @@ class BosonicQAOAIPSolver:
         mode = error_config.get('mode', 0)
         rate = error_config.get('rate', 1.0)
         n_th = error_config.get('n_th', 0.5)
-        # chi = error_config.get('chi', 0.1)
         eta = error_config.get('eta', 0.5)
         imbalance_rate = error_config.get('imbalance_rate', 0.1)
         other_mode = error_config.get('other_mode', 1)  # For cross-mode
@@ -533,15 +677,23 @@ class BosonicQAOAIPSolver:
             # Kerr is coherent, added to H; loss as L
             Ls.append(np.sqrt(imbalance_rate) * self.a_ops[mode])  # Reuse imbalance_rate as loss rate
             # Note: chi added to H in simulation call
+        elif error_type == 'amplitude_damping':
+            # Amplitude damping on all modes (zero temperature)
+            Ls = [np.sqrt(rate) * a for a in self.a_ops]
+        elif error_type == 'dephasing':
+            # Dephasing on number basis
+            Ls = [np.sqrt(rate) * n for n in self.n_ops]
+        else:
+            raise ValueError(f"Unsupported noise type: {error_type}")
 
         return Ls
 
-    def mitigate_gse_violation(self, rho_noisy: qt.Qobj, V: qt.Qobj, K: int = 2, A: Optional[qt.Qobj] = None) -> Tuple[float, float]:
+    def mitigate_gse_violation(self, rho_noisy: qt.Qobj, V: qt.Qobj, K: int = 2, A: Optional[qt.Qobj] = None) -> Tuple[float, float, qt.Qobj]:
         """
         Mitigate constraint violation <V> using GSE on noisy rho.
 
         Similar to mitigate_gse_expect, but specialized for V.
-        Returns (raw <V>, GSE <V>).
+        Returns (raw <V>, GSE <V>, mitigated_rho).
         """
         return self.mitigate_gse_expect(rho_noisy, V, subspace_type='power', K=K, A=A)
 
@@ -597,7 +749,7 @@ class BosonicQAOAIPSolver:
             # GSE mitigation for each t
             gse_expects = np.zeros_like(raw_expects)
             for idx, rho_t in enumerate(result.states):
-                _, gse_val = self.mitigate_gse_violation(rho_t, V, K=gse_K, A=A_gse)
+                raw, gse_val, _ = self.mitigate_gse_violation(rho_t, V, K=gse_K, A=A_gse)
                 gse_expects[idx] = gse_val
 
             results[label] = (raw_expects, gse_expects)
@@ -613,7 +765,7 @@ class BosonicQAOAIPSolver:
             # Ideal
             result_ideal = qt.mesolve(H_evol, rho0, tlist, [])
             viol_ideal = qt.expect(V, result_ideal.states)
-            _, gse_ideal = self.mitigate_gse_violation(result_ideal.states[0], V, K=gse_K, A=A_gse)  # Constant
+            _, gse_ideal, _ = self.mitigate_gse_violation(result_ideal.states[0], V, K=gse_K, A=A_gse)  # Constant
             ax.plot(tlist, viol_ideal, 'k-', label='Ideal (Raw)', linewidth=2)
             ax.plot(tlist, np.full_like(tlist, gse_ideal), 'k--', label='Ideal (GSE)', linewidth=2)
 
@@ -635,9 +787,9 @@ class BosonicQAOAIPSolver:
 
 if __name__ == "__main__":
     # Step 1: Define problem instance (small for demo: max x1 - x2 s.t. x1 + x2 = 1)
-    A = np.array([[1,-1,1,1],[1,1,-1,0]])  # Constraint matrix
-    b = np.array([3,2])        # RHS vector
-    c = np.array([1, -1, 2,1])  # Objective coefficients
+    A = np.array([[1,-1,1],[1,2,-1]])  # Constraint matrix
+    b = np.array([3,4])        # RHS vector
+    c = np.array([1, 2, 1])  # Objective coefficients
     N_trunc = 5              # Fock truncation (small for efficiency)
     p_layers = 2             # QAOA layers
     g_driver = 1.0           # Driver strength
@@ -645,41 +797,7 @@ if __name__ == "__main__":
     # Step 2: Initialize solver
     solver = BosonicQAOAIPSolver(
         A=A, b=b, c=c, N=N_trunc, p=p_layers, g=g_driver,
-        circuit_type="multi_beta", maxiter=50, seed=42
+        circuit_type="beta_gamma", maxiter=50, seed=42
     )
-
-    opt_result = solver.optimize()
-    solver.plot_results(save_path="figs/qaoa_ip_multi_beta.svg")
-    solver.print_summary()
-
-    # Step 4: Define error configurations for simulation
-    error_configs = [
-        {'type': 'photon_loss', 'mode': 0, 'rate': 0.5},      # Single-mode loss
-        {'type': 'photon_gain', 'mode': 1, 'rate': 0.5},       # Single-mode gain
-        {'type': 'thermal', 'mode': 0, 'rate': 0.5, 'n_th': 0.1},  # Thermal noise
-        {'type': 'cross_mode_unbalanced', 'mode': 0, 'other_mode': 1, 'eta': 0.3, 'imbalance_rate': 0.2},
-        {'type': 'kerr_loss', 'mode': 0, 'chi': 0.1, 'imbalance_rate': 0.1}  # Kerr + loss
-    ]
-
-    # Step 5: Time array for evolution
-    tlist = np.linspace(0, 5, 50)  # 20 time points up to t=0.2
-
-    # Step 6: Call simulate_errors with GSE (K=2 for power subspace)
-    gse_order_K = 3
-    results = solver.simulate_errors(
-        error_configs=error_configs,
-        tlist=tlist,
-        H_evol=solver.H_M,  # Evolve under driver Hamiltonian
-        initial_state=None,
-        gse_K=gse_order_K,
-        plot=True,  # Generate plot
-        save_path="figs/gse_violation_comparison.svg"
-    )
-
-    # Step 7: Analyze and print results (e.g., final violation reduction)
-    print("\n=== GSE Mitigation Summary (at final t) ===")
-    for label, (raw_viol, gse_viol) in results.items():
-        final_raw = raw_viol[-1]
-        final_gse = gse_viol[-1]
-        reduction = (final_raw - final_gse) / final_raw * 100 if final_raw > 0 else 0
-        print(f"{label}: Raw <V> = {final_raw:.4f}, GSE <V> = {final_gse:.4f}, Reduction = {reduction:.1f}%")
+    noise_cfgs = [{'type': 'photon_loss', 'rate': 0.05, 'mode': 0}, {'type': 'dephasing', 'rate': 0.03}]
+    solver.plot_optimization_comparison(modes=['ideal', 'noisy', 'gse'], noise_configs=noise_cfgs, gse_K=2)
