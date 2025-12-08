@@ -293,7 +293,7 @@ class BosonicQAOAIPSolver:
         gse_K: int = 2,
         lambda_penalty: float = 10.0,
         plot: bool = True,
-        save_path: str = "figs/gse_comparison.svg"
+        save_path: str = "plots/figs/gse_comparison.svg"
     ) -> Dict[str, np.ndarray]:
         """
         Simulate noisy evolution with joint vs. violation-first GSE, supporting multi-error configs.
@@ -384,15 +384,16 @@ A_test = [[1, 1,-1]]
 b_test = [1]
 c_test = [2.0, -1.0, 1]
 solver_test = BosonicQAOAIPSolver(A_test, b_test, c_test)
-error_configs_test =    [
-        {'type': 'photon_loss', 'mode': 0, 'rate': 0.5},      # Single-mode loss
-        {'type': 'photon_gain', 'mode': 1, 'rate': 0.5},       # Single-mode gain
-        {'type': 'thermal', 'mode': 0, 'rate': 0.5, 'n_th': 0.1},  # Thermal noise
+error_configs_test = [
+        {'type': 'photon_loss', 'mode': 0, 'rate': 0.1},      # Single-mode loss
+        {'type': 'photon_gain', 'mode': 1, 'rate': 0.1},       # Single-mode gain
+        {'type': 'photon_loss', 'mode': 2, 'rate': 0.1},      # Single-mode loss
+        {'type': 'thermal', 'mode': 0, 'rate': 0.1, 'n_th': 0.1},  # Thermal noise
         {'type': 'cross_mode_unbalanced', 'mode': 0, 'other_mode': 1, 'eta': 0.3, 'imbalance_rate': 0.2},
         {'type': 'kerr_loss', 'mode': 0, 'chi': 0.1, 'imbalance_rate': 0.1}  # Kerr + loss
     ]
-tlist_test = np.linspace(0, 3, 30)
-results_test = solver_test.simulate_errors(error_configs_test, tlist_test, initial_state=None,gse_K=4, lambda_penalty=0.1)
+tlist_test = np.linspace(0, 5, 100)
+results_test = solver_test.simulate_errors(error_configs_test, tlist_test, initial_state=None,gse_K=6, lambda_penalty=2)
 print("Raw HC:", results_test['raw_HC'])
 print("Raw V:", results_test['raw_V'])
 print("Joint HC:", results_test['joint_HC'])

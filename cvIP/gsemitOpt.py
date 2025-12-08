@@ -399,7 +399,7 @@ class BosonicQAOAIPSolver:
         modes: List[str],
         noise_configs: List[Dict],
         gse_K: int = 2,
-        save_path: str = "figs/optimization_comparison.svg"
+        save_path: str = "plots/figs/optimization_comparison.svg"
     ) -> None:
         """
         Run optimizations for multiple modes and noise configurations, plotting objective convergence.
@@ -482,7 +482,7 @@ class BosonicQAOAIPSolver:
             probs[ns] = abs(basis.overlap(state)) ** 2
         return probs
     
-    def plot_results(self, save_path: str = "figs/qaoa_ip_results.svg") -> None:
+    def plot_results(self, save_path: str = "plots/figs/qaoa_ip_results.svg") -> None:
         """Plot iteration history, costs, probs, objectives."""
         final_probs = self.get_fock_probs(self.final_state)
         final_tracked_probs = [final_probs[ns] for ns in self.tracked_states]
@@ -705,7 +705,7 @@ class BosonicQAOAIPSolver:
         initial_state: Optional[qt.Qobj] = None,
         gse_K: int = 2,
         plot: bool = True,
-        save_path: str = "figs/error_simulation_gse.svg"
+        save_path: str = "plots/figs/error_simulation_gse.svg"
     ) -> Dict[str, Tuple[np.ndarray, np.ndarray]]:
         """
         Simulate subspace confinement under noisy evolution, with GSE mitigation.
@@ -788,9 +788,9 @@ class BosonicQAOAIPSolver:
 if __name__ == "__main__":
     # Step 1: Define problem instance (small for demo: max x1 - x2 s.t. x1 + x2 = 1)
     A = np.array([[1,-1,1],[1,2,-1]])  # Constraint matrix
-    b = np.array([3,4])        # RHS vector
+    b = np.array([3,2])      # RHS vector
     c = np.array([1, 2, 1])  # Objective coefficients
-    N_trunc = 5              # Fock truncation (small for efficiency)
+    N_trunc = 6              # Fock truncation (small for efficiency)
     p_layers = 2             # QAOA layers
     g_driver = 1.0           # Driver strength
 
@@ -799,5 +799,5 @@ if __name__ == "__main__":
         A=A, b=b, c=c, N=N_trunc, p=p_layers, g=g_driver,
         circuit_type="multi_beta", maxiter=50, seed=42
     )
-    noise_cfgs = [{'type': 'photon_loss', 'rate': 0.05, 'mode': 0}, {'type': 'dephasing', 'rate': 0.03}]
+    noise_cfgs = [{'type': 'photon_loss', 'rate': 0.03, 'mode': 0}, {'type': 'dephasing', 'rate': 0.03}]
     solver.plot_optimization_comparison(modes=['ideal', 'noisy', 'gse'], noise_configs=noise_cfgs, gse_K=2)
