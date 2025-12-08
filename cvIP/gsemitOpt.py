@@ -797,7 +797,7 @@ if __name__ == "__main__":
     # Step 2: Initialize solver
     solver = BosonicQAOAIPSolver(
         A=A, b=b, c=c, N=N_trunc, p=p_layers, g=g_driver,
-        circuit_type="beta_gamma", maxiter=50, seed=42
+        circuit_type="multi_beta", maxiter=50, seed=42
     )
     noise_cfgs = [{'type': 'photon_loss', 'rate': 0.05, 'mode': 0}, {'type': 'dephasing', 'rate': 0.03}]
     solver.plot_optimization_comparison(modes=['ideal', 'noisy', 'gse'], noise_configs=noise_cfgs, gse_K=2)
