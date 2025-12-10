@@ -315,7 +315,7 @@ class BosonicQAOAIPSolver:
             probs[ns] = abs(basis.overlap(state)) ** 2
         return probs
     
-    def plot_results(self, save_path: str = "figs/qaoa_ip_results.svg") -> None:
+    def plot_results(self, save_path: str = "plots/figs/qaoa_ip_results.svg") -> None:
         """Plot iteration history, costs, probs, objectives."""
         final_probs = self.get_fock_probs(self.final_state)
         final_tracked_probs = [final_probs[ns] for ns in self.tracked_states]
@@ -594,7 +594,7 @@ class BosonicQAOAIPSolver:
         initial_state: Optional[qt.Qobj] = None,
         gse_K: int = 2,
         plot: bool = True,
-        save_path: str = "figs/error_simulation_hc_gse.svg"
+        save_path: str = "plots/figs/error_simulation_hc_gse.svg"
     ) -> Dict[str, Tuple[np.ndarray, np.ndarray]]:
         """
         Simulate noisy evolution: Mitigate V via GSE to get rho_EM^(V), then compute <H_C> on rho_EM^(V).
@@ -692,8 +692,8 @@ class BosonicQAOAIPSolver:
 
 if __name__ == "__main__":
     # Step 1: Define problem instance (small for demo: max x1 - x2 s.t. x1 + x2 = 1)
-    A = np.array([[1,-1,1,1],[1,1,-1,0]])  # Constraint matrix
-    b = np.array([3,2])        # RHS vector
+    A = np.array([[1,-1,0,1],[1,1,-1,0]])  # Constraint matrix
+    b = np.array([2,1])        # RHS vector
     c = np.array([1, -1, 2,1])  # Objective coefficients
     N_trunc = 5              # Fock truncation (small for efficiency)
     p_layers = 2             # QAOA layers
@@ -706,7 +706,7 @@ if __name__ == "__main__":
     )
 
     opt_result = solver.optimize()
-    solver.plot_results(save_path="figs/qaoa_ip_multi_beta.svg")
+    solver.plot_results(save_path="plots/figs/qaoa_ip_multi_beta.svg")
     solver.print_summary()
 
     # Step 4: Define error configurations for simulation
@@ -730,7 +730,7 @@ if __name__ == "__main__":
         initial_state=None,
         gse_K=gse_order_K,
         plot=True,  # Generate plot
-        save_path="figs/gse_violation_comparisonHC.svg"
+        save_path="plots/figs/gse_violation_comparisonHC.svg"
     )
 
     # Step 7: Analyze and print results (e.g., final violation reduction)

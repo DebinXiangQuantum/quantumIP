@@ -7,7 +7,8 @@ from scipy.optimize import minimize
 from scipy.sparse.linalg import expm_multiply, LinearOperator
 import sympy as sp
 from typing import List, Tuple, Optional, Union, Dict
-
+from scipy.sparse import csr_matrix
+import time
 
 class BosonicQAOAIPSolver:
     """
@@ -255,20 +256,15 @@ class BosonicQAOAIPSolver:
         state2 = qt.tensor(*[qt.fock(self.N, n) for n in min_ns])
         return (state1 + state2).unit()
 
-
     def _apply(self, H_qobj, theta, state):
         v = state.full().ravel(order='F')
         D = v.size
-
+        H_sparse = H_qobj.data_as(format='dia_matrix')
         def matvec(x):
-            x_q = qt.Qobj(x.reshape(state.shape, order='F'), dims=state.dims)
-            y_q = H_qobj * x_q
-            return (-1j * theta) * y_q.full().ravel(order='F')
+            return (-1j * theta) * H_sparse.dot(x)
 
         def rmatvec(x):
-            x_q = qt.Qobj(x.reshape(state.shape, order='F'), dims=state.dims)
-            y_q = H_qobj.dag() * x_q     # 对厄米 H，等于 H*x
-            return (1j * theta) * y_q.full().ravel(order='F')
+            return (1j * theta) * H_sparse.conj().T.dot(x)
 
         Aop = LinearOperator((D, D), matvec=matvec, rmatvec=rmatvec, dtype=np.complex128)
 
@@ -302,7 +298,6 @@ class BosonicQAOAIPSolver:
         for layer in range(self.p):
             for i in range(betalength):
                 beta = params[layer * (betalength) + i]
-                # state = (-1j * self.H_ds[i] * beta).expm() * state
                 state = self._apply(self.H_ds[i], beta, state)
         return state
     def qaoa_multi_beta_oneH_circuit(self, params: np.ndarray, initial_state: qt.Qobj) -> qt.Qobj:
@@ -592,7 +587,7 @@ class BosonicQAOAIPSolver:
         print(f"实验结果已保存到 {filename}")
 
     def _build_constraint_violation_operator(self) -> qt.Qobj:
-        """Build violation operator $V = \sum_j ( \sum_i A_{j,i} \hat{n}_i - b_j )^2$."""
+        """Build violation operator $$V = \sum_j ( \sum_i A_{j,i} \hat{n}_i - b_j )^2$$."""
         m_constraints = self.A.shape[0]
         V = 0 * self.n_ops[0]
         for j in range(m_constraints):
@@ -646,9 +641,9 @@ class BosonicQAOAIPSolver:
         Simulate subspace confinement under noisy evolution for multiple error configurations.
 
         The constraint violation is quantified by the expectation value of the operator
-        \[
+        $$
         \hat{V} = \sum_{j=1}^m \left( \sum_{i=1}^d A_{j,i} \hat{n}_i - b_j \right)^2,
-        \]
+        $$
         where \(\langle \hat{V} \rangle = 0\) indicates perfect confinement in the feasible subspace \(\{ | \mathbf{n} \rangle \mid A \mathbf{n} = \mathbf{b} \}\).
 
         Args:
@@ -809,7 +804,7 @@ if __name__ == "__main__":
     set_N = 10
     
     # 支持三种电路类型
-    circuit_types = ["beta_gamma", "multi_beta", "multi_beta_oneH"]
+    circuit_types = ["multi_beta","beta_gamma",  "multi_beta_oneH"]
     
     # 从命令行参数获取运行参数（用于并行执行）
     import sys
@@ -823,9 +818,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='运行QAOA求解器')
     parser.add_argument('run_id', type=int, nargs='?', default=0, help='运行ID')
     parser.add_argument('p', type=int, nargs='?', default=2, help='QAOA层数')
-    parser.add_argument('circuit_type', nargs='?', default=circuit_types[1], choices=circuit_types, help='电路类型')
-    parser.add_argument('--num_variables', type=int, default=4, help='变量数量')
-    parser.add_argument('--num_constraints', type=int, default=2, help='约束数量')
+    parser.add_argument('circuit_type', nargs='?', default=circuit_types[0], choices=circuit_types, help='电路类型')
+    parser.add_argument('--num_variables', type=int, default=6, help='变量数量')
+    parser.add_argument('--num_constraints', type=int, default=3, help='约束数量')
     
     # 如果提供了位置参数，使用它们
     # 这是为了保持向后兼容性
