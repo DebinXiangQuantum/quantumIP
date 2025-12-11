@@ -351,24 +351,57 @@ class BosonicQAOAIPSolver:
         mse_vfirst = 0.5 * (np.mean((vfirst_HC - ideal_HC)**2) + np.mean(vfirst_V**2))
 
         if plot:
-            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
-            ax1.plot(tlist, ideal_HC, 'k-.', label='ideal', linewidth=2)
-            ax1.plot(tlist, raw_HC, 'k-', label='Raw', linewidth=2)
-            # ax1.plot(tlist, joint_HC, 'b--', label='Joint GSE', linewidth=2)
-            ax1.plot(tlist, vfirst_HC, 'r-.', label='V-First GSE', linewidth=2)
-            # ax1.plot(tlist, joint_dual_HC, 'c--', label='Joint Dual-GSE', linewidth=2)
-            ax1.plot(tlist, vfirst_dual_HC, 'm-.', label='V-First Dual-GSE', linewidth=2)
+            width_pt = 240
+            inches_per_pt = 1 / 72.27
+            fig_width = width_pt * inches_per_pt
+
+            # 计算子图尺寸（16:9比例）
+            subplot_width = fig_width / 2  # 4列
+            subplot_height = subplot_width *0.8
+            fig_height = subplot_height  # 3行
+            fontsize = 7
+            plt.rcParams.update({
+                "font.family": "Arial",
+                "font.size": fontsize,
+                "figure.figsize": (fig_width, fig_height),
+                "axes.labelsize": fontsize,
+                "xtick.labelsize": fontsize,
+                "ytick.labelsize": fontsize,
+                ## tick label padding
+                "xtick.major.pad": 0.3,
+                "ytick.major.pad": 0.3,
+                "legend.fontsize": fontsize,
+                "axes.titlesize": fontsize,
+                "lines.markersize": 2.5,
+                "lines.linewidth": 0.7,
+                "lines.markeredgewidth": 0,
+                "grid.linewidth": 0.2,
+                "grid.alpha": 0.5,
+                "grid.color": "gray",
+                "axes.linewidth": 0.5,
+                "xtick.major.width": 0.5,
+                "ytick.major.width": 0.5,
+                "hatch.color": "black",
+                "hatch.linewidth": 0.5,
+            })
+            fig, (ax1, ax2) = plt.subplots(1, 2)
+            ax1.plot(tlist, ideal_HC, 'k-.', label='noise-free')
+            ax1.plot(tlist, raw_HC, '-',color = "#440154", label='with noise')
+            # ax1.plot(tlist, joint_HC, 'b--', label='Joint GSE')
+            # ax1.plot(tlist, vfirst_HC, 'r-.', label='V-First GSE')
+            # ax1.plot(tlist, joint_dual_HC, 'c--', label='Joint Dual-GSE')
+            ax1.plot(tlist, vfirst_dual_HC, '-.', color = "#1F77B4",  label='with Drift Manager')
             ax1.set_xlabel('Time $t$'); ax1.set_ylabel(r'$\langle \hat{H}_C \rangle$'); ax1.legend(); ax1.grid(alpha=0.3)
             
-            ax2.plot(tlist, ideal_V, 'k-.', label='ideal', linewidth=2)
-            ax2.plot(tlist, raw_V, 'k-', label='Raw', linewidth=2)
-            # ax2.plot(tlist, joint_V, 'b--', label='Joint GSE', linewidth=2)
-            ax2.plot(tlist, vfirst_V, 'r-.', label='V-First GSE', linewidth=2)
-            # ax2.plot(tlist, joint_dual_V, 'c--', label='Joint Dual-GSE', linewidth=2)
-            ax2.plot(tlist, vfirst_dual_V, 'm-.', label='V-First Dual-GSE', linewidth=2)
+            ax2.plot(tlist, ideal_V, '-.', label='noise-free')
+            ax2.plot(tlist, raw_V, '-',color = "#440154", label='with noise')
+            # ax2.plot(tlist, joint_V, 'b--', label='Joint GSE')
+            # ax2.plot(tlist, vfirst_V, 'r-.', label='V-First GSE')
+            # ax2.plot(tlist, joint_dual_V, 'c--', label='Joint Dual-GSE')
+            ax2.plot(tlist, vfirst_dual_V, '-.', color = "#1F77B4", label='with Drift Manager')
             ax2.set_xlabel('Time $t$'); ax2.set_ylabel(r'$\langle \hat{V} \rangle$'); ax2.legend(); ax2.grid(alpha=0.3); ax2.set_yscale('log')
 
-            plt.suptitle(f'GSE Comparison (K={gse_K}, λ={lambda_penalty})')
+            # plt.suptitle(f'GSE Comparison (K={gse_K}, λ={lambda_penalty})')
             plt.tight_layout()
             plt.savefig(save_path)
             plt.show()
@@ -392,7 +425,7 @@ error_configs_test = [
         {'type': 'cross_mode_unbalanced', 'mode': 0, 'other_mode': 1, 'eta': 0.3, 'imbalance_rate': 0.2},
         {'type': 'kerr_loss', 'mode': 0, 'chi': 0.1, 'imbalance_rate': 0.1}  # Kerr + loss
     ]
-tlist_test = np.linspace(0, 5, 100)
+tlist_test = np.linspace(0, 2.5, 100)
 results_test = solver_test.simulate_errors(error_configs_test, tlist_test, initial_state=None,gse_K=6, lambda_penalty=2)
 print("Raw HC:", results_test['raw_HC'])
 print("Raw V:", results_test['raw_V'])
